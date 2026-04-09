@@ -5,13 +5,13 @@ onnx>=1.15.0
 einops>=0.7.0
 
 # CUDA-specific versions for PyTorch and related libraries
-torch==2.2.0+cu121 
-torchvision==0.17.0+cu121 
-torchaudio==2.2.0+cu121 --index-url https://download.pytorch.org/whl/cu121
+torch==2.3.0+cu121
+torchvision==0.18.0+cu121 
+torchaudio==2.3.0+cu121 --index-url https://download.pytorch.org/whl/cu121
 
 # Data
 polars>=0.20.0
-numpy==1.26.4 
+numpy==2.2.6
 duckdb>=0.9.0
 pyarrow>=14.0.0
 pandas-ta>=0.3.14b
