@@ -1,0 +1,30 @@
+name: dual_branch
+type: dual_branch
+
+input:
+  feature_dim: 6      # OHLCV + spread
+  sequence_length: 120 # 2 hours of M1
+
+d_model: 192  # shared representation dimension
+
+price:
+  inception_channels: 128
+  n_inception_blocks: 2
+  kernel_sizes: [3, 5, 7, 11]
+  tcn_layers: 4
+  tcn_kernel_size: 3
+  dropout: 0.2
+
+sentiment:
+  input_dim: 768       # FinBERT hidden dim
+  hidden_dim: 256
+  dropout: 0.3
+
+fusion:
+  heads: 4
+  dropout: 0.1
+
+classifier:
+  hidden_dims: [128, 64]
+  dropout: 0.4
+  n_classes: 3  # sell, hold, buy

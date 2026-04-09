@@ -1,0 +1,125 @@
+# W&B Sweep for XAUUSD Dual-Branch Model
+# Usage:
+#   wandb sweep configs/sweep.yaml
+#   wandb agent <sweep_id>
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+
+program: scripts/train_supervised.py
+method: bayes
+metric:
+  name: val/loss
+  goal: minimize
+
+early_terminate:
+  type: hyperband
+  min_iter: 8
+  eta: 2
+  max_iter: 60
+
+parameters:
+  # Labeling — the critical axis
+  data.labeling.profit_target_pips:
+    distribution: categorical
+    values: [200, 300, 400, 500]
+
+  data.labeling.stop_loss_pips:
+    distribution: categorical
+    values: [100, 150, 200, 250]
+
+  data.labeling.max_holding_bars:
+    distribution: categorical
+    values: [60, 120, 180, 240]
+
+  data.labeling.method:
+    distribution: categorical
+    values: [triple_barrier, hybrid]
+
+  # Model
+  model.d_model:
+    distribution: categorical
+    values: [128, 192, 256]
+
+  model.price.tcn_layers:
+    distribution: categorical
+    values: [3, 4, 5]
+
+  model.price.dropout:
+    distribution: uniform
+    min: 0.15
+    max: 0.35
+
+  model.classifier.dropout:
+    distribution: uniform
+    min: 0.3
+    max: 0.5
+
+  model.input.sequence_length:
+    distribution: categorical
+    values: [60, 120, 240]
+
+  # Training
+  training.learning_rate:
+    distribution: log_uniform_values
+    min: 0.00005
+    max: 0.001
+
+  training.batch_size:
+    distribution: categorical
+    values: [256, 512]
+
+  training.gradient_clip:
+    distribution: categorical
+    values: [1.0, 2.0, 3.0]
+
+  training.weight_decay:
+    distribution: log_uniform_values
+    min: 0.000001
+    max: 0.0001
+
+  # Data
+  data.preprocessing.scaling:
+    distribution: categorical
+    values: [window_minmax, zscore]
+
+  data.preprocessing.window_size:
+    distribution: categorical
+    values: [60, 120, 240]
+
+  data.sentiment.enabled:
+    distribution: categorical
+    values: [true, false]
+
+  # Fixed
+  data.labeling.pip_value:
+    value: 0.10
+  data.name:
+    value: xauusd
+  data.symbol:
+    value: XAUUSD
+  data.timeframe:
+    value: M1
+  model.name:
+    value: dual_branch
+  model.type:
+    value: dual_branch
+  project.seed:
+    value: 42
+  project.device:
+    value: auto
+  training.epochs:
+    value: 60
+  training.early_stopping_patience:
+    value: 15
+  training.mixed_precision:
+    value: false
+  training.num_workers:
+    value: 4
+  training.val_split:
+    value: 0.15
+  training.test_split:
+    value: 0.10

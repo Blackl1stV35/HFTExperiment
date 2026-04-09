@@ -1,0 +1,21 @@
+name: sac
+type: sac
+
+agent:
+  gamma: 0.99
+  tau: 0.005
+  lr: 3e-4
+  hidden_dims: [256, 256]
+  batch_size: 256
+  buffer_capacity: 500_000
+
+training:
+  total_steps: 500_000
+  eval_every: 5_000
+
+reward:
+  profit_weight: 1.0
+  risk_penalty: 0.5
+  slippage_model: true
+  commission_per_lot: 7.0
+  spread_pips: 2.0

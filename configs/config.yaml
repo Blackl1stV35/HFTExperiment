@@ -1,0 +1,32 @@
+defaults:
+  - model: dual_branch
+  - rl: sac
+  - data: xauusd
+  - _self_
+
+project:
+  name: xauusd-v2
+  seed: 42
+  device: auto
+
+training:
+  epochs: 60
+  batch_size: 512
+  learning_rate: 2e-4
+  weight_decay: 1e-5
+  early_stopping_patience: 15
+  gradient_clip: 2.0
+  mixed_precision: false
+  num_workers: 4
+  val_split: 0.15
+  test_split: 0.10
+
+logging:
+  wandb_project: xauusd-v2
+  wandb_entity: null
+
+paths:
+  data_dir: data
+  model_dir: models
+  log_dir: logs
+  export_dir: exports

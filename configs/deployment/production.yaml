@@ -1,0 +1,35 @@
+name: production
+mode: paper  # paper | live
+
+inference:
+  engine: onnx
+  device: cpu
+  model_path: exports/best_model.onnx
+  max_latency_ms: 5.0
+
+broker:
+  type: mt5
+  symbol: XAUUSD
+  lot_size: 0.01
+  max_lots: 0.10
+  magic_number: 20260101
+
+risk:
+  max_daily_drawdown_pct: 2.0
+  max_position_risk_pct: 2.0
+  max_consecutive_losses: 5
+  loss_reduction_factor: 0.5
+  latency_kill_ms: 50.0
+  news_blackout_minutes: 30
+  blackout_events: [FOMC, NFP, CPI, PPI, GDP]
+  human_exit_approval: true
+
+hitl:
+  enabled: true
+  auto_approve_confidence: 0.7
+  auto_approve_max_lots: 0.03
+
+monitoring:
+  prometheus_port: 9090
+  telegram_enabled: true
+  heartbeat_interval: 300

@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+data/*.duckdb
+data/*.csv
+data/*.npy
+data/sentiment_cache/
+data/ft_cache/
+models/*.pt
+models/*.onnx
+exports/
+logs/
+wandb/
+outputs/
+multirun/
+.DS_Store
+*.ipynb_checkpoints/
+rust_inference/target/
+
+# Workspace
+xauusd-v2.zip
+train.ipynb
+
