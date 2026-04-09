@@ -4,6 +4,8 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv-gpu/
+.venv-ta/
 .env
 data/*.duckdb
 data/*.csv
