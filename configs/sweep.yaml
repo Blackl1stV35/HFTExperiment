@@ -4,8 +4,9 @@
 #   wandb agent <sweep_id>
 
 command:
-  - D:\HFTExperiment\.venv\Scripts\python.exe
-  - scripts/train_supervised.py
+  - ${env}
+  - python
+  - ${program}
   - ${args_no_hyphens}
 
 program: scripts/train_supervised.py

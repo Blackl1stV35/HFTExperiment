@@ -30,8 +30,6 @@ from loguru import logger
 from src.data.ft_scraper import FTSitemapScraper, FTArticleCache
 from src.utils.logger import setup_logger
 
-from dotenv import load_dotenv
-load_dotenv()
 
 async def scrape(args):
     """Run FT sitemap scraping pipeline (async — uses Playwright for articles)."""

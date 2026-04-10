@@ -1,5 +1,3 @@
-program: train.py
-
 defaults:
   - model: dual_branch
   - rl: sac

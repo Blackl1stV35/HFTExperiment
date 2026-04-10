@@ -22,8 +22,4 @@ multirun/
 .DS_Store
 *.ipynb_checkpoints/
 rust_inference/target/
-
-# Workspace
 xauusd-v2.zip
-train.ipynb
-

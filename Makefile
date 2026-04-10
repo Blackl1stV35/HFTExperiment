@@ -27,10 +27,13 @@ train-hybrid:
 	python scripts/train_supervised.py model=dual_branch data=xauusd data.labeling.method=hybrid
 
 train-rl:
-	python scripts/train_rl.py --data-dir data --steps 500000
+	python scripts/train_rl.py --checkpoint models/dual_branch_best.pt --steps 500000 --max-hold 120
 
 train-rl-gan:
-	python scripts/train_rl.py --data-dir data --steps 500000 --use-gan
+	python scripts/train_rl.py --checkpoint models/dual_branch_best.pt --steps 500000 --use-gan
+
+train-rl-long:
+	python scripts/train_rl.py --checkpoint models/dual_branch_best.pt --steps 1000000 --eval-every 20000
 
 # Evaluation
 backtest:
