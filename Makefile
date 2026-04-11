@@ -27,13 +27,28 @@ train-hybrid:
 	python scripts/train_supervised.py model=dual_branch data=xauusd data.labeling.method=hybrid
 
 train-rl:
-	python scripts/train_rl.py --checkpoint models/dual_branch_best.pt --steps 500000 --max-hold 120
+	python scripts/train_rl.py \
+		--checkpoint models/dual_branch_best.pt \
+		--steps 500000 \
+		--max-hold 120 \
+		--confidence-gate 0.3 \
+		--episode-len 2000 \
+		--eval-every 10000
 
-train-rl-gan:
-	python scripts/train_rl.py --checkpoint models/dual_branch_best.pt --steps 500000 --use-gan
+train-rl-quick:
+	python scripts/train_rl.py \
+		--checkpoint models/dual_branch_best.pt \
+		--steps 200000 \
+		--confidence-gate 0.35 \
+		--eval-every 5000
 
 train-rl-long:
-	python scripts/train_rl.py --checkpoint models/dual_branch_best.pt --steps 1000000 --eval-every 20000
+	python scripts/train_rl.py \
+		--checkpoint models/dual_branch_best.pt \
+		--steps 1000000 \
+		--max-hold 120 \
+		--confidence-gate 0.3 \
+		--eval-every 20000
 
 # Evaluation
 backtest:
