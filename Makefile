@@ -54,8 +54,14 @@ train-rl-long:
 backtest:
 	python scripts/backtest.py model=dual_branch data=xauusd
 
+backtest-filtered:
+	python scripts/backtest.py model=dual_branch data=xauusd ++min_confidence=0.5
+
+backtest-strict:
+	python scripts/backtest.py model=dual_branch data=xauusd ++min_confidence=0.7
+
 backtest-hitl:
-	python scripts/backtest.py model=dual_branch data=xauusd ++risk.human_exit_approval=true
+	python scripts/backtest.py model=dual_branch data=xauusd ++risk.human_exit_approval=true ++min_confidence=0.5
 
 # Sweep
 sweep:
