@@ -13,14 +13,14 @@ preprocessing:
   remove_weekends: true
 
 labeling:
-  method: triple_barrier   # triple_barrier | macd_rsi | hybrid
-  profit_target_pips: 300  # $30 at pip_value=0.10
-  stop_loss_pips: 150      # $15
-  max_holding_bars: 120    # 2 hours — forces hold labels
+  method: hybrid              # sweep-confirmed optimal (was triple_barrier)
+  profit_target_pips: 300
+  stop_loss_pips: 150
+  max_holding_bars: 80        # PATCH v2: aligned to RL sweep-optimal (was 120)
   pip_value: 0.10
 
 sentiment:
-  enabled: false           # enable after >60% daily coverage
+  enabled: false
   model: ProsusAI/finbert
   embedding_dim: 768
   training_source:

@@ -8,10 +8,16 @@ agent:
   hidden_dims: [256, 256]
   batch_size: 256
   buffer_capacity: 500_000
+  curriculum_warmup_steps: 100_000   # PATCH v3: exit threshold 0.0→-0.10 at this step
 
 training:
   total_steps: 500_000
-  eval_every: 5_000
+  eval_every: 8_000
+
+environment:
+  max_hold: 80
+  confidence_gate: 0.48              # reward scaling only — no pre-trade gate
+  episode_len: 2000
 
 reward:
   profit_weight: 1.0
@@ -19,3 +25,6 @@ reward:
   slippage_model: true
   commission_per_lot: 7.0
   spread_pips: 2.0
+  hold_penalty_coeff: 0.003          # PATCH v3: was 0.002
+  mtm_scale: 0.05
+  early_cut_bonus_frac: 0.40         # PATCH v3: was 0.30

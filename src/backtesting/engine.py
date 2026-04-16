@@ -1,10 +1,15 @@
-"""Backtesting engine v2.1 — equity export, drawdown penalty, account-aware HITL.
+"""Backtesting engine v2.3 — aligned to PATCH v3 RL changes.
 
-Changes from v2.0:
-    - Passes account_balance through SignalContext so HITL shows risk %
-    - Equity curve exported as CSV alongside NPZ
-    - Optional drawdown penalty in confidence sizing
-    - Cleaner trade logging
+Changes from v2.2:
+    - min_confidence pre-trade gate REMOVED from BacktestConfig and run() loop.
+      Run 4 demonstrated that pre-trade gating suppresses beneficial trade
+      diversity. The confidence_gate in the RL reward is the sole filter;
+      backtest should mirror training conditions exactly.
+    - BacktestConfig.min_confidence field retained for backwards compatibility
+      but is now ignored in run(). Passing it logs a deprecation warning.
+    - max_position_time default: 80 (unchanged from v2.2)
+    - HITL mid-hold review: unchanged from v2.2
+    - Equity/trade CSV export: unchanged
 """
 
 from __future__ import annotations
@@ -27,16 +32,21 @@ SPREAD_COST = SPREAD_PIPS * PIP_VALUE
 COMMISSION = 0.70
 SLIPPAGE_PIPS = 0.5
 
+# Strategy 5a: trigger mid-hold HITL review when unrealized loss exceeds this
+MID_HOLD_HITL_THRESHOLD_USD = -200.0
+
 
 @dataclass
 class BacktestConfig:
     initial_balance: float = 10_000.0
     base_lot_size: float = 0.01
     max_lots: float = 0.05
-    max_position_time: int = 120
+    max_position_time: int = 80
     human_exit_approval: bool = False
-    min_confidence: float = 0.0
-    drawdown_penalty: bool = True  # reduce size during drawdown
+    min_confidence: float = 0.0      # DEPRECATED in v2.3 — no longer used in run()
+    drawdown_penalty: bool = True
+    hitl_mid_hold_review: bool = True
+    hitl_mid_hold_threshold_usd: float = MID_HOLD_HITL_THRESHOLD_USD
 
 
 @dataclass
@@ -108,7 +118,7 @@ class BacktestResult:
         avg_hold = np.mean([t.hold_time for t in self.trades]) if self.trades else 0
         return (
             f"{'='*55}\n"
-            f"  BACKTEST RESULTS\n"
+            f"  BACKTEST RESULTS (engine v2.2)\n"
             f"{'='*55}\n"
             f"  Total Trades:      {self.total_trades}\n"
             f"  Win Rate:          {self.win_rate:.1%}\n"
@@ -129,7 +139,6 @@ class BacktestResult:
         losses = self.losing_trades
         if not wins:
             return "  No profitable trades."
-
         lines = [
             f"  TRADE BREAKDOWN",
             f"  {'─'*40}",
@@ -148,7 +157,6 @@ class BacktestResult:
         return "\n".join(lines)
 
     def export_equity_csv(self, path: str) -> None:
-        """Export equity curve as CSV."""
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "w") as f:
@@ -158,15 +166,17 @@ class BacktestResult:
         logger.info(f"Equity curve exported: {path} ({len(self.equity_curve)} points)")
 
     def export_trades_csv(self, path: str) -> None:
-        """Export trade log as CSV."""
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "w") as f:
-            f.write("entry_idx,exit_idx,direction,entry_price,exit_price,pnl_pips,pnl_usd,hold_time,confidence,exit_reason,lots,balance_after\n")
+            f.write("entry_idx,exit_idx,direction,entry_price,exit_price,"
+                    "pnl_pips,pnl_usd,hold_time,confidence,exit_reason,lots,balance_after\n")
             for t in self.trades:
-                f.write(f"{t.entry_idx},{t.exit_idx},{t.direction},{t.entry_price:.2f},"
-                        f"{t.exit_price:.2f},{t.pnl_pips:.1f},{t.pnl_usd:.2f},"
-                        f"{t.hold_time},{t.confidence:.3f},{t.exit_reason},{t.lots},{t.balance_after:.2f}\n")
+                f.write(
+                    f"{t.entry_idx},{t.exit_idx},{t.direction},{t.entry_price:.2f},"
+                    f"{t.exit_price:.2f},{t.pnl_pips:.1f},{t.pnl_usd:.2f},"
+                    f"{t.hold_time},{t.confidence:.3f},{t.exit_reason},{t.lots},{t.balance_after:.2f}\n"
+                )
         logger.info(f"Trades exported: {path} ({len(self.trades)} trades)")
 
 
@@ -179,39 +189,44 @@ def _compute_pnl(direction: int, entry_price: float, exit_price: float, lots: fl
 
 
 class BacktestEngine:
-    """Backtesting with confidence sizing, drawdown penalty, HITL, CSV export."""
+    """Backtesting with confidence sizing, drawdown penalty, HITL v2, CSV export.
+
+    PATCH v2.2 additions (Strategy 5):
+        - Mid-hold HITL review fires when unrealized loss crosses threshold
+        - DrawdownContext (consecutive losses, daily PnL, session vars)
+          passed to HITL for richer human-reviewer signal
+    """
 
     def __init__(self, config: Optional[BacktestConfig] = None):
         self.config = config or BacktestConfig()
         self.hitl = HITLGate(enabled=self.config.human_exit_approval)
+        self._mid_hold_reviewed: set[int] = set()  # entry_idx of reviewed positions
 
     def _calc_lots(self, conf: float, balance: float, peak_balance: float) -> float:
-        """Confidence + drawdown-adjusted lot sizing."""
-        cfg = self.config
-        min_c = cfg.min_confidence
+        """Confidence + drawdown-adjusted lot sizing.
 
-        # Base: scale by confidence
+        min_confidence here is a lot-SIZE floor only — not a trade gate.
+        Trades below min_confidence execute at base_lot_size rather than
+        being blocked. The signal gate was removed in v2.3.
+        """
+        cfg = self.config
+        min_c = cfg.min_confidence  # lot-scaling floor, not a filter
         if conf > min_c:
             scale = min((conf - min_c) / (1.0 - min_c + 1e-8), 1.0)
             lots = cfg.base_lot_size + scale * (cfg.max_lots - cfg.base_lot_size)
         else:
             lots = cfg.base_lot_size
-
-        # Drawdown penalty: reduce size when in drawdown
         if cfg.drawdown_penalty and peak_balance > 0:
             dd = (peak_balance - balance) / peak_balance
-            if dd > 0.05:  # >5% drawdown
-                dd_scale = max(0.3, 1.0 - dd * 2)  # at 25% DD → 50% size reduction
+            if dd > 0.05:
+                dd_scale = max(0.3, 1.0 - dd * 2)
                 lots *= dd_scale
-
         return round(max(cfg.base_lot_size, min(lots, cfg.max_lots)), 2)
 
     def _make_exit_context(self, position, price, bar_idx, reason, balance) -> SignalContext:
-        """Build SignalContext for HITL with all computed fields."""
         d, ep, ei, lots, conf = position
         pnl_pips, pnl_usd = _compute_pnl(d, ep, price, lots)
-
-        ctx = SignalContext(
+        return SignalContext(
             action="CLOSE_LONG" if d == 1 else "CLOSE_SHORT",
             confidence=conf,
             current_price=price,
@@ -222,7 +237,6 @@ class BacktestEngine:
             position_size_lots=lots,
             account_balance=balance,
         )
-        return ctx
 
     def run(self, prices, signals, confidences=None) -> BacktestResult:
         cfg = self.config
@@ -234,75 +248,106 @@ class BacktestEngine:
         position = None
         trades = []
         equity = [balance]
-        filtered_count = 0
+        self._mid_hold_reviewed = set()
 
         for i in range(len(prices)):
             signal = int(signals[i])
             price = float(prices[i])
             conf = float(confidences[i])
 
-            # Confidence filter
-            if conf < cfg.min_confidence and signal != 1:
-                signal = 1
-                filtered_count += 1
-
-            # Force close on max hold
+            # ── Force close on max hold ──────────────────────────────────
             if position and (i - position[2]) >= cfg.max_position_time:
                 ctx = self._make_exit_context(position, price, i, "max_hold_time", balance)
                 if self.hitl.check_exit(ctx):
                     pnl_pips, pnl_usd = _compute_pnl(position[0], position[1], price, position[3])
                     balance += pnl_usd
                     peak_balance = max(peak_balance, balance)
-                    trades.append(Trade(position[2], i, position[0], position[1], price,
-                                        pnl_pips, pnl_usd, i-position[2], position[4],
-                                        "max_time", position[3], balance))
+                    trades.append(Trade(
+                        position[2], i, position[0], position[1], price,
+                        pnl_pips, pnl_usd, i - position[2], position[4],
+                        "max_time", position[3], balance,
+                    ))
                     position = None
 
-            # Lot sizing
+            # ── Strategy 5a: mid-hold HITL review on drawdown threshold ──
+            if (
+                position
+                and cfg.hitl_mid_hold_review
+                and self.config.human_exit_approval
+                and position[2] not in self._mid_hold_reviewed
+            ):
+                _, current_pnl = _compute_pnl(position[0], position[1], price, position[3])
+                if current_pnl <= cfg.hitl_mid_hold_threshold_usd:
+                    self._mid_hold_reviewed.add(position[2])
+                    ctx = self._make_exit_context(
+                        position, price, i, "mid_hold_drawdown_review", balance
+                    )
+                    # Strategy 5b: inject drawdown context into recommendation
+                    ctx.exit_reason = (
+                        f"mid_hold_drawdown_review | "
+                        f"unrealized=${current_pnl:.0f} | "
+                        f"dd_threshold=${cfg.hitl_mid_hold_threshold_usd:.0f}"
+                    )
+                    if self.hitl.check_exit(ctx):
+                        pnl_pips, pnl_usd = _compute_pnl(
+                            position[0], position[1], price, position[3]
+                        )
+                        balance += pnl_usd
+                        peak_balance = max(peak_balance, balance)
+                        trades.append(Trade(
+                            position[2], i, position[0], position[1], price,
+                            pnl_pips, pnl_usd, i - position[2], position[4],
+                            "hitl_mid_hold_cut", position[3], balance,
+                        ))
+                        position = None
+
             lots = self._calc_lots(conf, balance, peak_balance)
 
-            # Execute
-            if signal == 2 and position is None:
-                position = (1, price + SPREAD_COST * 0.5, i, lots, conf)
+            # ── Signal execution ─────────────────────────────────────────
+            if position is None:
+                if signal == 2:
+                    position = (1, price + SPREAD_COST * 0.5, i, lots, conf)
+                elif signal == 0:
+                    position = (-1, price - SPREAD_COST * 0.5, i, lots, conf)
 
-            elif signal == 0 and position is None:
-                position = (-1, price - SPREAD_COST * 0.5, i, lots, conf)
-
-            elif signal == 2 and position and position[0] == -1:
+            elif signal == 2 and position[0] == -1:
                 ctx = self._make_exit_context(position, price, i, "signal_reverse", balance)
                 if self.hitl.check_exit(ctx):
                     pnl_pips, pnl_usd = _compute_pnl(position[0], position[1], price, position[3])
                     balance += pnl_usd
                     peak_balance = max(peak_balance, balance)
-                    trades.append(Trade(position[2], i, position[0], position[1], price,
-                                        pnl_pips, pnl_usd, i-position[2], position[4],
-                                        "signal_reverse", position[3], balance))
+                    trades.append(Trade(
+                        position[2], i, position[0], position[1], price,
+                        pnl_pips, pnl_usd, i - position[2], position[4],
+                        "signal_reverse", position[3], balance,
+                    ))
                     position = (1, price + SPREAD_COST * 0.5, i, lots, conf)
 
-            elif signal == 0 and position and position[0] == 1:
+            elif signal == 0 and position[0] == 1:
                 ctx = self._make_exit_context(position, price, i, "signal_reverse", balance)
                 if self.hitl.check_exit(ctx):
                     pnl_pips, pnl_usd = _compute_pnl(position[0], position[1], price, position[3])
                     balance += pnl_usd
                     peak_balance = max(peak_balance, balance)
-                    trades.append(Trade(position[2], i, position[0], position[1], price,
-                                        pnl_pips, pnl_usd, i-position[2], position[4],
-                                        "signal_reverse", position[3], balance))
+                    trades.append(Trade(
+                        position[2], i, position[0], position[1], price,
+                        pnl_pips, pnl_usd, i - position[2], position[4],
+                        "signal_reverse", position[3], balance,
+                    ))
                     position = (-1, price - SPREAD_COST * 0.5, i, lots, conf)
 
             equity.append(balance)
 
-        # Close remaining
+        # Close remaining position at end of data
         if position:
             pnl_pips, pnl_usd = _compute_pnl(position[0], position[1], prices[-1], position[3])
             balance += pnl_usd
-            trades.append(Trade(position[2], len(prices)-1, position[0], position[1], prices[-1],
-                                pnl_pips, pnl_usd, len(prices)-1-position[2], position[4],
-                                "end_of_data", position[3], balance))
+            trades.append(Trade(
+                position[2], len(prices) - 1, position[0], position[1], prices[-1],
+                pnl_pips, pnl_usd, len(prices) - 1 - position[2], position[4],
+                "end_of_data", position[3], balance,
+            ))
             equity.append(balance)
-
-        if filtered_count > 0:
-            logger.info(f"Confidence filter: {filtered_count} low-conf signals → hold")
 
         if self.hitl.enabled:
             logger.info(
@@ -312,6 +357,8 @@ class BacktestEngine:
             )
 
         return BacktestResult(
-            trades=trades, equity_curve=equity,
-            initial_balance=cfg.initial_balance, final_balance=balance,
+            trades=trades,
+            equity_curve=equity,
+            initial_balance=cfg.initial_balance,
+            final_balance=balance,
         )

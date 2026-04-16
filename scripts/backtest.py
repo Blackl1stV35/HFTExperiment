@@ -36,7 +36,7 @@ def main(cfg: DictConfig) -> None:
     set_seed(cfg.project.seed)
     device = get_device(cfg.project.device)
 
-    min_confidence = cfg.get("min_confidence", 0.0)
+    # pre-trade confidence gate removed in v2.3 — reward gate is the sole filter
     export_csv = cfg.get("export_csv", True)
 
     # Load data
@@ -129,7 +129,6 @@ def main(cfg: DictConfig) -> None:
     bt_config = BacktestConfig(
         initial_balance=10_000.0,
         human_exit_approval=cfg.get("risk", {}).get("human_exit_approval", False),
-        min_confidence=min_confidence,
     )
     engine = BacktestEngine(bt_config)
     result = engine.run(test_prices, signals, confs)
