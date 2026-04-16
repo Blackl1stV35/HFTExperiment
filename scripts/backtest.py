@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
-"""Backtest the dual-branch model with confidence filtering.
+"""Backtest with confidence filtering, equity export, and trade analysis.
 
 Usage:
-    # Standard backtest
     python scripts/backtest.py model=dual_branch data=xauusd
-
-    # Only trade when confidence > 0.5
     python scripts/backtest.py model=dual_branch data=xauusd ++min_confidence=0.5
-
-    # With HITL approval on exits
+    python scripts/backtest.py model=dual_branch data=xauusd ++min_confidence=0.7 ++export_csv=true
     python scripts/backtest.py model=dual_branch data=xauusd ++risk.human_exit_approval=true
-
-    # Show only profitable trade analysis
-    python scripts/backtest.py model=dual_branch data=xauusd ++show_winners=true
 """
 
 from __future__ import annotations
@@ -43,9 +36,8 @@ def main(cfg: DictConfig) -> None:
     set_seed(cfg.project.seed)
     device = get_device(cfg.project.device)
 
-    # Parse extra flags
     min_confidence = cfg.get("min_confidence", 0.0)
-    show_winners = cfg.get("show_winners", False)
+    export_csv = cfg.get("export_csv", True)
 
     # Load data
     store = TickStore(cfg.paths.data_dir + "/ticks.duckdb")
@@ -60,7 +52,7 @@ def main(cfg: DictConfig) -> None:
         df, cfg.data.preprocessing.scaling, cfg.data.preprocessing.window_size,
     )
 
-    # Label (for test split calculation)
+    # Label
     label_cfg = LabelConfig(
         method=cfg.data.labeling.method,
         profit_target_pips=cfg.data.labeling.profit_target_pips,
@@ -104,24 +96,20 @@ def main(cfg: DictConfig) -> None:
     if Path(ckpt_path).exists():
         checkpoint = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
-        logger.info(f"Loaded checkpoint: {ckpt_path}")
+        logger.info(f"Loaded: {ckpt_path}")
     else:
         logger.warning(f"No checkpoint at {ckpt_path}")
 
-    # Generate predictions
+    # Predict
     model.to(device)
     model.eval()
-    predictions = []
-    confidences = []
+    predictions, confidences = [], []
 
     with torch.no_grad():
-        batch_size = 512
-        for i in range(0, len(X_test), batch_size):
-            batch_x = torch.FloatTensor(X_test[i:i+batch_size]).to(device)
-            batch_s = None
-            if S_test is not None:
-                batch_s = torch.FloatTensor(S_test[i:i+batch_size]).to(device)
-            logits, conf = model(batch_x, batch_s)
+        for i in range(0, len(X_test), 512):
+            bx = torch.FloatTensor(X_test[i:i+512]).to(device)
+            bs = torch.FloatTensor(S_test[i:i+512]).to(device) if S_test is not None else None
+            logits, conf = model(bx, bs)
             predictions.extend(logits.argmax(dim=-1).cpu().numpy())
             confidences.extend(conf.squeeze(-1).cpu().numpy())
 
@@ -129,22 +117,15 @@ def main(cfg: DictConfig) -> None:
     confs = np.array(confidences)
 
     min_len = min(len(signals), len(test_prices))
-    signals = signals[:min_len]
-    confs = confs[:min_len]
-    test_prices = test_prices[:min_len]
+    signals, confs, test_prices = signals[:min_len], confs[:min_len], test_prices[:min_len]
 
-    # Log confidence distribution
     logger.info(
-        f"Predictions: {len(signals)} signals | "
-        f"Confidence: mean={confs.mean():.3f} min={confs.min():.3f} max={confs.max():.3f} | "
-        f"Signal dist: sell={np.mean(signals==0):.1%} hold={np.mean(signals==1):.1%} buy={np.mean(signals==2):.1%}"
+        f"Predictions: {len(signals)} | "
+        f"Conf: mean={confs.mean():.3f} std={confs.std():.3f} | "
+        f"Signals: sell={np.mean(signals==0):.1%} hold={np.mean(signals==1):.1%} buy={np.mean(signals==2):.1%}"
     )
 
-    if min_confidence > 0:
-        n_filtered = np.sum((confs < min_confidence) & (signals != 1))
-        logger.info(f"Confidence filter: {n_filtered} signals below {min_confidence:.2f} will be skipped")
-
-    # Run backtest
+    # Backtest
     bt_config = BacktestConfig(
         initial_balance=10_000.0,
         human_exit_approval=cfg.get("risk", {}).get("human_exit_approval", False),
@@ -153,50 +134,92 @@ def main(cfg: DictConfig) -> None:
     engine = BacktestEngine(bt_config)
     result = engine.run(test_prices, signals, confs)
 
-    # Print result
+    # Results
     logger.info(f"\n{result.summary()}")
+    logger.info(f"\n{result.profitable_trades_summary()}")
 
-    # Show profitable trades analysis
-    if show_winners or True:  # always show this
-        logger.info(f"\n{result.profitable_trades_summary()}")
-
-    # Confidence-stratified analysis
     if result.total_trades > 5:
         _confidence_analysis(result)
 
-    # Save
+    # Export
     output_dir = Path(cfg.paths.log_dir) / "backtests"
     output_dir.mkdir(parents=True, exist_ok=True)
+
     np.savez(
         str(output_dir / f"{cfg.model.name}_backtest.npz"),
         equity_curve=np.array(result.equity_curve),
-        signals=signals,
-        confidences=confs,
-        prices=test_prices,
+        signals=signals, confidences=confs, prices=test_prices,
     )
+
+    if export_csv:
+        result.export_equity_csv(str(output_dir / "equity_curve.csv"))
+        result.export_trades_csv(str(output_dir / "trades.csv"))
+
+        # Simple equity plot
+        _plot_equity(result.equity_curve, str(output_dir / "equity_curve.png"))
+
     logger.info(f"Results saved to {output_dir}")
 
 
 def _confidence_analysis(result):
-    """Show performance stratified by confidence bands."""
+    """Performance by confidence band."""
     trades = result.trades
-    if not trades:
-        return
+    bands = [
+        (0.0, 0.3, "Low  (0-30%)"),
+        (0.3, 0.5, "Med  (30-50%)"),
+        (0.5, 0.7, "High (50-70%)"),
+        (0.7, 1.01, "Best (70%+)"),
+    ]
 
-    bands = [(0, 0.3, "Low"), (0.3, 0.5, "Med"), (0.5, 0.7, "High"), (0.7, 1.0, "V.High")]
-    logger.info("\n  Confidence-stratified analysis:")
-    logger.info(f"  {'Band':<10} {'Trades':>7} {'Win%':>7} {'Avg PnL':>10} {'Tot PnL':>12}")
-    logger.info(f"  {'─'*48}")
+    logger.info(f"\n  CONFIDENCE-STRATIFIED ANALYSIS")
+    logger.info(f"  {'Band':<16} {'N':>5} {'Win%':>7} {'AvgPnL':>10} {'TotPnL':>12} {'AvgHold':>8}")
+    logger.info(f"  {'─'*60}")
 
     for lo, hi, name in bands:
-        band_trades = [t for t in trades if lo <= t.confidence < hi]
-        if not band_trades:
+        bt = [t for t in trades if lo <= t.confidence < hi]
+        if not bt:
+            logger.info(f"  {name:<16} {'—':>5}")
             continue
-        n = len(band_trades)
-        wins = sum(1 for t in band_trades if t.pnl_usd > 0)
-        avg = np.mean([t.pnl_usd for t in band_trades])
-        total = sum(t.pnl_usd for t in band_trades)
-        logger.info(f"  {name:<10} {n:>7} {wins/n:>6.1%} ${avg:>9.2f} ${total:>11.2f}")
+        n = len(bt)
+        wins = sum(1 for t in bt if t.pnl_usd > 0)
+        avg_pnl = np.mean([t.pnl_usd for t in bt])
+        tot_pnl = sum(t.pnl_usd for t in bt)
+        avg_hold = np.mean([t.hold_time for t in bt])
+        logger.info(f"  {name:<16} {n:>5} {wins/n:>6.1%} ${avg_pnl:>9.2f} ${tot_pnl:>11.2f} {avg_hold:>7.0f}")
+
+    # Key insight
+    best_band = [t for t in trades if t.confidence >= 0.7]
+    if best_band:
+        best_pf = sum(t.pnl_usd for t in best_band if t.pnl_usd > 0) / max(abs(sum(t.pnl_usd for t in best_band if t.pnl_usd <= 0)), 1e-8)
+        logger.info(f"\n  High-confidence (70%+) profit factor: {best_pf:.2f}")
+
+
+def _plot_equity(equity_curve, path):
+    """Save a simple equity curve plot."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.plot(equity_curve, linewidth=0.8, color="#2563eb")
+        ax.axhline(y=equity_curve[0], color="#94a3b8", linewidth=0.5, linestyle="--")
+        ax.fill_between(range(len(equity_curve)), equity_curve[0], equity_curve,
+                         where=[e >= equity_curve[0] for e in equity_curve],
+                         alpha=0.15, color="#22c55e")
+        ax.fill_between(range(len(equity_curve)), equity_curve[0], equity_curve,
+                         where=[e < equity_curve[0] for e in equity_curve],
+                         alpha=0.15, color="#ef4444")
+        ax.set_xlabel("Bar")
+        ax.set_ylabel("Equity ($)")
+        ax.set_title("Equity Curve")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        logger.info(f"Equity plot saved: {path}")
+    except ImportError:
+        logger.warning("matplotlib not available — skipping equity plot")
 
 
 if __name__ == "__main__":

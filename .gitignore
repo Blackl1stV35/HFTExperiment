@@ -7,7 +7,6 @@ build/
 .venv-gpu/
 .venv-ta/
 .env
-models/*
 data/*.duckdb
 data/*.csv
 data/*.npy
@@ -23,4 +22,3 @@ multirun/
 .DS_Store
 *.ipynb_checkpoints/
 rust_inference/target/
-xauusd-v2.zip
