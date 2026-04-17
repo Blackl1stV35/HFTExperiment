@@ -6,6 +6,7 @@ build/
 .venv/
 .venv-gpu/
 .venv-ta/
+.venv-research/
 .env
 data/*.duckdb
 data/*.csv
@@ -22,3 +23,5 @@ multirun/
 .DS_Store
 *.ipynb_checkpoints/
 rust_inference/target/
+
+*.ipynb

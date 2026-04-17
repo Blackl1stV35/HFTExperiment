@@ -13,11 +13,16 @@ preprocessing:
   remove_weekends: true
 
 labeling:
-  method: hybrid              # sweep-confirmed optimal (was triple_barrier)
+  method: hybrid              # sweep-confirmed optimal
   profit_target_pips: 300
   stop_loss_pips: 150
-  max_holding_bars: 80        # PATCH v2: aligned to RL sweep-optimal (was 120)
+  max_holding_bars: 80        # aligned to RL sweep-optimal
   pip_value: 0.10
+  # PATCH v4: class weights to counter 90.7% hold-class dominance.
+  # Applied as CrossEntropyLoss(weight=...) in supervised training.
+  # Sell/buy upweighted 2.5×; hold downweighted to 0.3 (natural ~3% share each).
+  # Recalibrate if label distribution changes after data expansion.
+  class_weights: [2.5, 0.3, 2.5]   # [sell, hold, buy]
 
 sentiment:
   enabled: false

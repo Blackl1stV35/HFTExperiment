@@ -51,6 +51,7 @@ from gymnasium import spaces
 
 from src.data.preprocessing import prepare_features
 from src.data.tick_store import TickStore
+from src.data.feature_engineering import compute_rl_obs_features
 from src.encoder.fusion import DualBranchModel
 from src.meta_policy.rl_agent import ConfidenceSACAgent
 from src.training.labels import create_sequences
@@ -78,48 +79,52 @@ class FrozenEncoderEnv(gym.Env):
 
     def __init__(
         self,
-        signals: np.ndarray,        # (N, 3) softmax probabilities
-        confidences: np.ndarray,     # (N,)   confidence [0,1]
-        prices: np.ndarray,          # (N,)   close prices
+        signals: np.ndarray,         # (N, 3) softmax probabilities
+        confidences: np.ndarray,      # (N,)   confidence [0,1]
+        prices: np.ndarray,           # (N,)   close prices
+        # PATCH v4: 3 new market-context arrays (obs 7→10)
+        atr_norm: np.ndarray | None = None,       # rolling ATR/close [0, 0.05]
+        trend_norm: np.ndarray | None = None,     # EMA slope/close clipped [-2,2]
+        session_phase: np.ndarray | None = None,  # London/NY overlap [0,1]
         max_hold: int = 80,
         episode_len: int = 2000,
-        confidence_gate: float = 0.48,  # used ONLY in reward scaling — no pre-trade filter
+        confidence_gate: float = 0.48,
         spread_pips: float = 2.0,
         pip_value: float = 0.10,
         commission_usd: float = 0.70,
         lot_size: float = 0.01,
         initial_balance: float = 10_000.0,
-        # Reward shaping coefficients (patch v3 defaults)
         mtm_scale: float = 0.05,
-        hold_penalty_coeff: float = 0.003,   # PATCH v3: was 0.002
-        early_cut_bonus_frac: float = 0.40,  # PATCH v3: was 0.30
+        hold_penalty_coeff: float = 0.003,
+        early_cut_bonus_frac: float = 0.40,
     ):
         super().__init__()
         assert len(signals) == len(confidences) == len(prices)
+        n = len(prices)
 
-        self.signals = signals.astype(np.float32)
+        self.signals    = signals.astype(np.float32)
         self.confidences = confidences.astype(np.float32)
-        self.prices = prices.astype(np.float64)
-        self.max_hold = max_hold
-        self.episode_len = min(episode_len, len(prices) - 1)
+        self.prices      = prices.astype(np.float64)
+        self.atr_norm      = atr_norm.astype(np.float32)      if atr_norm      is not None else np.zeros(n, np.float32)
+        self.trend_norm    = trend_norm.astype(np.float32)    if trend_norm    is not None else np.zeros(n, np.float32)
+        self.session_phase = session_phase.astype(np.float32) if session_phase is not None else np.full(n, 0.5, np.float32)
+
+        self.max_hold      = max_hold
+        self.episode_len   = min(episode_len, len(prices) - 1)
         self.confidence_gate = confidence_gate
-        self.spread_cost = spread_pips * pip_value
-        self.commission = commission_usd
-        self.lot_size = lot_size
+        self.spread_cost   = spread_pips * pip_value
+        self.commission    = commission_usd
+        self.lot_size      = lot_size
         self.initial_balance = initial_balance
-        self.pip_value = pip_value
-
-        # Reward shaping
-        self.mtm_scale = mtm_scale
-        self.hold_penalty_coeff = hold_penalty_coeff
+        self.pip_value     = pip_value
+        self.mtm_scale     = mtm_scale
+        self.hold_penalty_coeff  = hold_penalty_coeff
         self.early_cut_bonus_frac = early_cut_bonus_frac
-        # Curriculum: training loop updates this via env.exit_threshold = agent._exit_threshold
-        self.exit_threshold: float = 0.0  # starts at warmup value
+        self.exit_threshold: float = 0.0
 
-        # obs: [sell, hold, buy, conf, pos_dir, unrealized_norm, hold_time_norm]
-        self.observation_space = spaces.Box(-np.inf, np.inf, (7,), np.float32)
-        # action: [position_size, exit_logit]  (Strategy 3)
-        self.action_space = spaces.Box(-1.0, 1.0, (2,), np.float32)
+        # PATCH v4: obs = 10-dim [sell,hold,buy,conf,pos_dir,unreal,hold_t,atr,trend,session]
+        self.observation_space = spaces.Box(-np.inf, np.inf, (10,), np.float32)
+        self.action_space      = spaces.Box(-1.0, 1.0, (2,), np.float32)
 
         self._offset = 0
         self._reset_state()
@@ -152,17 +157,20 @@ class FrozenEncoderEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         gi = self._global_idx()
-        sig = self.signals[gi]
+        sig  = self.signals[gi]
         conf = self.confidences[gi]
         unreal = 0.0
         if self.position_dir != 0:
             unreal = self._unrealized_usd() / self.pip_value / 100.0
         return np.array([
-            sig[0], sig[1], sig[2],
-            conf,
-            float(self.position_dir),
-            np.clip(unreal, -5.0, 5.0),
-            min(self.hold_time / max(self.max_hold, 1), 1.0),
+            sig[0], sig[1], sig[2],                          # signal probs
+            conf,                                             # model confidence
+            float(self.position_dir),                        # -1/0/1
+            np.clip(unreal, -5.0, 5.0),                      # unrealized PnL norm
+            min(self.hold_time / max(self.max_hold, 1), 1.0), # hold fraction
+            self.atr_norm[gi],                               # PATCH v4: volatility
+            self.trend_norm[gi],                             # PATCH v4: trend slope
+            self.session_phase[gi],                          # PATCH v4: session time
         ], dtype=np.float32)
 
     def _close_position(self, voluntary: bool = False) -> float:
@@ -290,7 +298,7 @@ class FrozenEncoderEnv(gym.Env):
             if self.position_dir != 0:
                 reward += self._close_position(voluntary=False)
 
-        obs = self._get_obs() if not (terminated or truncated) else np.zeros(7, np.float32)
+        obs = self._get_obs() if not (terminated or truncated) else np.zeros(10, np.float32)
         info = {
             "balance": self.balance,
             "episode_pnl": self.episode_pnl,
@@ -467,6 +475,25 @@ def main():
 
     signals, confidences = extract_model_features(model, X, None, device)
 
+    # PATCH v4: compute market-context features for expanded 10-dim obs
+    logger.info("Computing RL obs context features (ATR, trend, session phase)...")
+    # seq_prices is aligned with signals; pass timestamps if available
+    try:
+        store = TickStore(f"{args.data_dir}/ticks.duckdb")
+        df_ts = store.query_ohlcv(args.symbol, "M1")
+        store.close()
+        raw_ts = df_ts["timestamp"].to_list()
+        offset = args.window_size + args.seq_length - 1
+        seq_timestamps = raw_ts[offset : offset + len(signals)]
+        if len(seq_timestamps) < len(signals):
+            seq_timestamps = None
+    except Exception:
+        seq_timestamps = None
+
+    atr_norm, trend_norm, session_phase = compute_rl_obs_features(
+        prices=seq_prices, timestamps=seq_timestamps
+    )
+
     split = int(len(signals) * 0.8)
     logger.info(f"Split: train={split:,} eval={len(signals)-split:,}")
 
@@ -477,6 +504,9 @@ def main():
         mtm_scale=args.mtm_scale,
         hold_penalty_coeff=args.hold_penalty,
         early_cut_bonus_frac=args.early_cut_bonus,
+        atr_norm=atr_norm[:split],
+        trend_norm=trend_norm[:split],
+        session_phase=session_phase[:split],
     )
     train_env = FrozenEncoderEnv(
         signals=signals[:split],
@@ -488,29 +518,38 @@ def main():
         signals=signals[split:],
         confidences=confidences[split:],
         prices=seq_prices[split:],
-        **env_kwargs,
+        atr_norm=atr_norm[split:],
+        trend_norm=trend_norm[split:],
+        session_phase=session_phase[split:],
+        max_hold=args.max_hold,
+        episode_len=args.episode_len,
+        confidence_gate=args.confidence_gate,
+        mtm_scale=args.mtm_scale,
+        hold_penalty_coeff=args.hold_penalty,
+        early_cut_bonus_frac=args.early_cut_bonus,
     )
 
     logger.info(
-        f"RL Environment (PATCH v3):\n"
-        f"  obs_dim=7, action=[pos_size, exit_logit] 2-dim\n"
+        f"RL Environment (PATCH v4):\n"
+        f"  obs_dim=10 [sell,hold,buy,conf,pos_dir,unreal,hold_t,atr,trend,session]\n"
+        f"  action=[pos_size, exit_logit] 2-dim\n"
         f"  max_hold={args.max_hold}, episode_len={args.episode_len}\n"
-        f"  confidence_gate={args.confidence_gate} (reward scaling only — no pre-trade gate)\n"
+        f"  confidence_gate={args.confidence_gate} (reward scaling only)\n"
         f"  spread_cost=${train_env.spread_cost:.2f}, commission=${train_env.commission:.2f}\n"
         f"  mtm_scale={args.mtm_scale}, hold_penalty={args.hold_penalty}, "
         f"early_cut_bonus={args.early_cut_bonus}\n"
         f"  curriculum_warmup={args.curriculum_warmup:,} steps"
     )
 
-    # Agent: obs_dim=7, action_dim=2 (Strategy 3)
+    # PATCH v4: obs_dim=10
     agent = ConfidenceSACAgent(
-        obs_dim=7,
+        obs_dim=10,
         hidden_dims=[256, 256],
         device=str(device),
         curriculum_warmup_steps=args.curriculum_warmup,
     )
     logger.info(
-        f"SAC agent created: obs=7, action=2 (pos_size + exit_logit), hidden=[256,256]\n"
+        f"SAC agent created: obs=10, action=2 (pos_size + exit_logit), hidden=[256,256]\n"
         f"  Curriculum warmup: EXIT_THRESHOLD=0.0 for first {args.curriculum_warmup:,} steps, "
         f"then {ConfidenceSACAgent.EXIT_THRESHOLD_FINAL}"
     )

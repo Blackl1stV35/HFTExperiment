@@ -276,3 +276,150 @@ python scripts/backtest.py model=dual_branch data=xauusd \
 
 Note: `++min_confidence=X` overrides are now ignored. Remove them from any
 existing scripts or Makefile targets.
+
+---
+
+## Patch v4 — data expansion + obs-dim + regime research
+
+Applied after v3 training run analysis. Three root causes addressed:
+(1) 12-month single-regime dataset; (2) 90.7% hold-signal dominance;
+(3) RL obs missing market-state context causing 25-trade steady-state lock-in.
+
+### Files changed in v4
+
+| File | Change |
+|---|---|
+| `scripts/download_data.py` | Full rewrite: chunked MT5, yfinance fallback, 9-symbol support |
+| `src/data/feature_engineering.py` | `compute_rl_obs_features()` added |
+| `scripts/train_rl.py` | obs 7→10, ATR/trend/session integrated, env updated |
+| `configs/data/xauusd.yaml` | `class_weights: [2.5, 0.3, 2.5]` |
+| `requirements-ta.txt` | Expanded: yfinance, MetaTrader5, full TA stack |
+| `requirements-research.txt` | New: isolated notebook env |
+| `notebooks/00_market_regime_explorer.ipynb` | New: 15-cell regime analysis |
+
+### Change 1 — Dataset expansion to 6666 days (≈2008)
+
+**File:** `scripts/download_data.py`
+
+MT5 safety analysis: `copy_rates_range()` on a single 6666-day M1 request
+silently truncates at the broker history boundary (typically 2–5yr for M1).
+Solution: 30-day chunked windows with 0.5s sleep between requests and
+resume support via last stored timestamp in DuckDB.
+
+For pre-2019 history and non-price instruments (DXY, USD10Y, US500), the
+script falls back to yfinance which provides unlimited D1 history back to
+2000+:
+
+```bash
+# Full 6666-day history via yfinance (daily bars, all 9 tickers):
+python scripts/download_data.py \
+  --source yfinance \
+  --regime-tickers \
+  --timeframe D1 \
+  --days 6666
+
+# Recent M1 XAUUSD via MT5 (chunked, resume-safe):
+python scripts/download_data.py \
+  --source mt5 \
+  --symbol XAUUSD \
+  --timeframe M1 \
+  --days 6666
+```
+
+### Change 2 — Class-weighted loss for label imbalance
+
+**File:** `configs/data/xauusd.yaml`
+
+The 90.7% hold-class dominance means the supervised model achieves 90%
+accuracy by always predicting hold. Fix: add class weights to the
+CrossEntropyLoss in supervised training:
+
+```yaml
+class_weights: [2.5, 0.3, 2.5]   # [sell, hold, buy]
+```
+
+Apply in the supervised training script:
+```python
+weights = torch.tensor(cfg.data.labeling.class_weights).to(device)
+criterion = nn.CrossEntropyLoss(weight=weights)
+```
+
+The 2.5× upweight on sell/buy forces the model to learn non-hold patterns
+even when they are rare. Re-tune after data expansion — the imbalance ratio
+will shift with more ranging-market data (2015–2022 period).
+
+### Change 3 — RL observation expanded 7→10 dims
+
+**Files:** `scripts/train_rl.py`, `src/data/feature_engineering.py`
+
+New observation vector:
+```
+[sell_prob, hold_prob, buy_prob,   # 0-2: supervised signal
+ confidence,                        # 3: model confidence
+ position_dir,                      # 4: -1/0/1
+ unrealized_pnl_norm,               # 5: clipped [-5, 5]
+ hold_time_norm,                    # 6: [0, 1]
+ atr_norm,                          # 7: rolling ATR/close [0, 0.05] NEW
+ trend_norm,                        # 8: EMA slope/close clipped [-2,2] NEW
+ session_phase]                     # 9: London/NY overlap [0,1] NEW
+```
+
+`atr_norm` tells the agent current volatility regime — high ATR means
+wider price swings, so holding through a dip is riskier.
+
+`trend_norm` tells the agent whether it is trading with or against the
+short-term trend — counter-trend holds should exit earlier.
+
+`session_phase` breaks the 25-trade time-lock. The 25 trades / 2000 bars
+steady-state was the agent learning pure time-based exits. With session
+phase, the agent can learn that exit decisions at 0.0 (off-hours) vs 0.9
+(peak London/NY) should be different.
+
+The `ConfidenceSACAgent` `obs_dim` parameter is updated to 10. Existing
+v3 checkpoints (`rl_agent_best.pt`) are **incompatible** — retrain required.
+
+### Change 4 — Market regime explorer notebook
+
+**File:** `notebooks/00_market_regime_explorer.ipynb`
+
+15-cell Jupyter notebook covering:
+- Data download: 9 instruments, 6666 days via yfinance
+- Cross-asset overview and normalised price chart
+- Rolling 252-day correlation matrix with XAUUSD
+- Business cycle 4-quadrant (growth × inflation proxy from asset prices)
+- Gold drivers: real yield proxy, DXY correlation, G/S ratio, G/Oil ratio
+- Volatility regime detection (low / normal / high thresholds)
+- HMM 3-state classification (Bear / Neutral / Bull) on XAUUSD
+- K-means 4-cluster consensus cycle score across all 9 instruments
+- Signal quality table: accuracy and Sharpe by regime
+- Export: `data/regime/daily_regime_labels.csv` for ML pipeline
+
+Run with:
+```bash
+# In research venv:
+pip install -r requirements-research.txt
+jupyter lab notebooks/00_market_regime_explorer.ipynb
+```
+
+### Recommended full re-training sequence (v4)
+
+```bash
+# Step 1: Expand dataset
+python scripts/download_data.py --source yfinance --regime-tickers --timeframe D1 --days 6666
+python scripts/download_data.py --source mt5 --symbol XAUUSD --timeframe M1 --days 6666
+
+# Step 2: Re-train supervised model with class weights
+# (add weight= to CrossEntropyLoss, see xauusd.yaml class_weights)
+python scripts/train_supervised.py model=dual_branch data=xauusd
+
+# Step 3: Re-train RL with 10-dim obs
+python scripts/train_rl.py \
+  --checkpoint models/dual_branch_best.pt \
+  --max-hold 80 --confidence-gate 0.48 \
+  --eval-every 8000 --seed 42 --steps 500000 \
+  --mtm-scale 0.05 --hold-penalty 0.003 --early-cut-bonus 0.40 \
+  --curriculum-warmup 100000
+
+# Step 4: Run regime notebook
+cd notebooks && jupyter lab 00_market_regime_explorer.ipynb
+```
