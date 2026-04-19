@@ -83,11 +83,15 @@ def build_regime_balanced_sampler(
             f"Temporal reweighting: pre-2020={pre2020.sum():,} ×1.5, "
             f"post-2024={post2024.sum():,} ×0.5"
         )
-
     sample_weights = torch.FloatTensor(label_w * regime_mult)
+    
+    # CRITICAL FIX: Cap the epoch size so the CPU doesn't freeze
+    # 500,000 is plenty of samples for one epoch and takes <5 seconds to calculate
+    epoch_size = min(500000, len(sample_weights))
+    
     sampler = WeightedRandomSampler(
         weights=sample_weights,
-        num_samples=len(sample_weights),
+        num_samples=epoch_size,
         replacement=True,
     )
     logger.info(
@@ -295,7 +299,7 @@ def main(cfg: DictConfig) -> None:
 
     train_loader = DataLoader(train_ds, batch_size=cfg.training.batch_size,
                               sampler=sampler, num_workers=cfg.training.num_workers,
-                              pin_memory=True)
+                              pin_memory=False)  # <--- CHANGED TO FALSE
     val_loader   = DataLoader(val_ds,   batch_size=cfg.training.batch_size)
     test_loader  = DataLoader(test_ds,  batch_size=cfg.training.batch_size)
     logger.info(f"Train: {n_train}, Val: {n_val}, Test: {n_test}")
