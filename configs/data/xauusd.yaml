@@ -1,36 +1,22 @@
+# XAUUSD M1 data configuration — Phase 3
 name: xauusd
 symbol: XAUUSD
 timeframe: M1
 
-source:
-  type: mt5
-  duckdb_path: data/ticks.duckdb
-
 preprocessing:
   scaling: window_minmax
   window_size: 120
-  fill_gaps: forward_fill
-  remove_weekends: true
 
 labeling:
-  method: hybrid              # sweep-confirmed optimal
+  method: hybrid
   profit_target_pips: 300
   stop_loss_pips: 150
-  max_holding_bars: 80        # aligned to RL sweep-optimal
+  max_holding_bars: 80          # aligned with sweep-optimal max_hold
   pip_value: 0.10
-  # PATCH v4: class weights to counter 90.7% hold-class dominance.
-  # Applied as CrossEntropyLoss(weight=...) in supervised training.
-  # Sell/buy upweighted 2.5×; hold downweighted to 0.3 (natural ~3% share each).
-  # Recalibrate if label distribution changes after data expansion.
-  class_weights: [2.5, 0.3, 2.5]   # [sell, hold, buy]
+  # Phase 3: explicit class weights [sell, hold, buy]
+  # Overrides auto-computed sqrt-dampened weights in the balanced sampler
+  class_weights: [2.5, 0.3, 2.5]
 
 sentiment:
   enabled: false
-  model: ProsusAI/finbert
   embedding_dim: 768
-  training_source:
-    type: ft_sitemap
-    cache_dir: data/ft_cache
-  live_source:
-    type: gdelt
-    update_interval: 900

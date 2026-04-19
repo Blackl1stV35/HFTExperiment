@@ -1,30 +1,39 @@
-name: sac
-type: sac
-
+# SAC RL agent configuration — Phase 3
 agent:
+  obs_dim: 13                   # 7 base + 3 v4 market context + 3 Phase 3 regime
+  hidden_dims: [256, 256]
   gamma: 0.99
   tau: 0.005
-  lr: 3e-4
-  hidden_dims: [256, 256]
+  lr: 3.0e-4
+  buffer_capacity: 500000
   batch_size: 256
-  buffer_capacity: 500_000
-  curriculum_warmup_steps: 100_000   # PATCH v3: exit threshold 0.0→-0.10 at this step
 
 training:
-  total_steps: 500_000
-  eval_every: 8_000
+  steps: 500000
+  eval_every: 8000
+  curriculum_warmup: 100000     # EXIT_THRESHOLD 0.0 → -0.10 at step 100k
+  seed: 42
 
 environment:
-  max_hold: 80
-  confidence_gate: 0.48              # reward scaling only — no pre-trade gate
+  max_hold: 80                  # default; overridden per-bar by G/S quartile
   episode_len: 2000
+  confidence_gate: 0.48
+  spread_pips: 2.0
+  pip_value: 0.10
+  commission_usd: 0.70
+  initial_balance: 10000.0
 
 reward:
-  profit_weight: 1.0
-  risk_penalty: 0.5
-  slippage_model: true
-  commission_per_lot: 7.0
-  spread_pips: 2.0
-  hold_penalty_coeff: 0.003          # PATCH v3: was 0.002
-  mtm_scale: 0.05
-  early_cut_bonus_frac: 0.40         # PATCH v3: was 0.30
+  mtm_scale: 0.05               # mark-to-market step reward
+  hold_penalty_coeff: 0.003     # quadratic hold penalty
+  early_cut_bonus_frac: 0.40    # fraction of avoided loss returned as bonus
+
+# Phase 3 regime conditioning
+regime:
+  regime_csv: data/regime/daily_regime_labels.csv
+  # G/S-conditioned max_hold limits (bars)
+  gs_q1_hold: 40                # Q1 silver-leads: commodity/mean-reverting
+  gs_q23_hold: 60               # Q2/Q3: neutral
+  gs_q4_hold: 80                # Q4 gold-leads: fear-bid/trending
+  # GMM2 entry gate
+  gmm2_entry_gate: true         # block new entries in Bear regime (gmm2=0)
