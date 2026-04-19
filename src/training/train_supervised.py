@@ -120,11 +120,9 @@ class Trainer:
         )
 
         # Phase 3: use config class weights if provided
-        if class_weights is not None:
-            w = torch.FloatTensor(class_weights).to(device)
-        else:
-            w = None
-        self.criterion = nn.CrossEntropyLoss(weight=w)
+        # FIX: Since the Sampler is already balancing the classes, 
+        # do NOT apply class weights to the loss function (prevents double-dipping)
+        self.criterion = nn.CrossEntropyLoss(weight=None)
         self.confidence_criterion = nn.MSELoss()
 
         self.best_val_loss = float("inf")
