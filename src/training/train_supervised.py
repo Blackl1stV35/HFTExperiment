@@ -139,8 +139,8 @@ def build_regime_balanced_sampler(
     if timestamps is not None and len(timestamps) == n:
         import pandas as pd
         ts       = pd.to_datetime(timestamps)
-        pre2020  = (ts < pd.Timestamp("2020-01-01")).to_numpy()
-        post2024 = (ts >= pd.Timestamp("2024-01-01")).to_numpy()
+        pre2020  = (ts < pd.Timestamp("2020-01-01"))
+        post2024 = (ts >= pd.Timestamp("2024-01-01"))
         regime_mult[pre2020]  *= 1.5
         regime_mult[post2024] *= 0.5
         logger.info(
