@@ -128,7 +128,9 @@ def build_regime_balanced_sampler(
         # Handle both Series and ndarray returns from pd.to_datetime()
         if hasattr(ts, 'to_numpy'):
             ts = ts.to_numpy()
-        pre2020 = ts < pd.Timestamp("2020-01-01").value
+        # Convert both to datetime64[ns] for safe comparison
+        cutoff = np.datetime64('2020-01-01', 'ns')
+        pre2020 = ts < cutoff
         regime_mult[pre2020] *= 1.5
         logger.info(f"Temporal reweighting: pre-2020={pre2020.sum():,} x1.5")
 
