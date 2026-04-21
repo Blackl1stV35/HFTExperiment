@@ -215,12 +215,15 @@ def build_regime_balanced_sampler(
         regime_mult[gmm2 == 0] = 2.0
 
     if timestamps is not None and len(timestamps) == n:
-        import pandas as pd
-        ts      = pd.to_datetime(timestamps)
-        pre2020 = (ts < pd.Timestamp("2020-01-01")) 
-        pre2020 = pre2020.to_numpy()     
-        regime_mult[pre2020] *= 1.5
-        logger.info(f"Temporal reweighting: pre-2020={pre2020.sum():,} x1.5")
+            import pandas as pd
+            ts      = pd.to_datetime(timestamps)
+            cutoff  = pd.Timestamp("2020-01-01")
+            # pd.to_datetime on a list returns DatetimeIndex (no .to_numpy on the
+            # boolean result); on a Series it returns Series (has .to_numpy).
+            # np.asarray works on both and avoids the datetime64 ufunc mismatch.
+            pre2020 = np.asarray(ts < cutoff, dtype=bool)
+            regime_mult[pre2020] *= 1.5
+            logger.info(f"Temporal reweighting: pre-2020={pre2020.sum():,} x1.5")
 
     final_weights     = torch.FloatTensor(sample_weights * regime_mult)
     actual_epoch_size = min(epoch_size, n)
