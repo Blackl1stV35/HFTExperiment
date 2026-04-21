@@ -12,7 +12,7 @@ project:
 training:
   epochs: 60
   batch_size: 2048
-  learning_rate: 1e-4
+  learning_rate: 5e-5
   weight_decay: 1e-5
   early_stopping_patience: 15
   gradient_clip: 10.0
