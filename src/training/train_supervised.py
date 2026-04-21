@@ -140,12 +140,9 @@ def build_regime_balanced_sampler(
         import pandas as pd
         ts       = pd.to_datetime(timestamps)
         pre2020  = (ts < pd.Timestamp("2020-01-01"))
-        post2024 = (ts >= pd.Timestamp("2024-01-01"))
         regime_mult[pre2020]  *= 1.5
-        regime_mult[post2024] *= 0.5
         logger.info(
-            f"Temporal reweighting: pre-2020={pre2020.sum():,} x1.5, "
-            f"post-2024={post2024.sum():,} x0.5"
+            f"Temporal reweighting: pre-2020={pre2020.sum():,} x1.5"
         )
 
     final_weights      = torch.FloatTensor(sample_weights * regime_mult)
@@ -193,6 +190,7 @@ class Trainer:
         self.confidence_criterion = nn.MSELoss()
 
         self.best_val_loss    = float("inf")
+        self.best_signal_score = 0.0
         self.patience_counter = 0
         self.start_epoch      = 1
 
@@ -230,7 +228,7 @@ class Trainer:
             with torch.no_grad():
                 is_correct = (logits.argmax(dim=-1) == y).float().unsqueeze(-1)
             conf_loss = self.confidence_criterion(confidence, is_correct)
-            loss = signal_loss + 0.3 * conf_loss
+            loss = signal_loss + 0.5 * conf_loss
             loss.backward()
             nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.cfg.training.gradient_clip
@@ -300,24 +298,50 @@ class Trainer:
             "per_class":        per_class,
         }
 
-    def check_early_stopping(self, val_loss: float) -> bool:
-        if val_loss < self.best_val_loss:
-            self.best_val_loss    = val_loss
-            self.patience_counter = 0
+    @staticmethod
+    def _signal_score(pc: dict) -> float:
+        """Weighted metric that rewards minority-class recall over overall accuracy.
+        Val loss minimum = most hold-dominant epoch = wrong checkpoint criterion.
+        sell_R x0.4 + buy_R x0.4 + val_acc x0.2 picks the epoch where sell/buy
+        recall peaks rather than the epoch where the model mostly predicts hold.
+        """
+        return pc["sell"]["recall"] * 0.4 + pc["buy"]["recall"] * 0.4
+
+    def check_early_stopping(self, val_m: dict) -> bool:
+        score = self._signal_score(val_m["per_class"])
+        if score > self.best_signal_score:
+            self.best_signal_score = score
+            self.patience_counter  = 0
             return False
         self.patience_counter += 1
         return self.patience_counter >= self.cfg.training.early_stopping_patience
 
+    GDRIVE_DIR = "/content/drive/MyDrive/Colab Notebooks"
+
     def save_checkpoint(self, path: str, epoch: int, metrics: dict) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
+        payload = {
             "epoch":                epoch,
             "model_state_dict":     self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "metrics":              metrics,
             "config":               OmegaConf.to_container(self.cfg),
-        }, path)
+        }
+        torch.save(payload, path)
         logger.info(f"Checkpoint saved: {path}")
+
+        # Mirror to Google Drive so Colab runtime disconnections don't lose it
+        gdrive_path = Path(self.GDRIVE_DIR)
+        if gdrive_path.exists():
+            import shutil
+            dest = gdrive_path / Path(path).name
+            shutil.copy2(path, dest)
+            logger.info(f"Checkpoint mirrored to Drive: {dest}")
+        else:
+            logger.warning(
+                f"Google Drive not mounted at {self.GDRIVE_DIR}. "
+                "Run: from google.colab import drive; drive.mount('/content/drive')"
+            )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -481,9 +505,11 @@ def main(cfg: DictConfig) -> None:
             f"Epoch {epoch}/{cfg.training.epochs} | "
             f"Train loss={train_m['loss']:.4f} acc={train_m['accuracy']:.4f} | "
             f"Val   loss={val_m['loss']:.4f}  acc={val_m['accuracy']:.4f} | "
+            f"SignalScore={score:.4f} | "                   
             f"Conf {val_m['confidence_mean']:.3f}+-{val_m['confidence_std']:.3f} | "
             f"GradNorm={train_m['grad_norm']:.2f}"
         )
+        
         logger.info(
             f"  Per-class val | "
             f"sell  P={pc['sell']['precision']:.3f} R={pc['sell']['recall']:.3f} (n={pc['sell']['n']:,}) | "
@@ -501,6 +527,7 @@ def main(cfg: DictConfig) -> None:
                 "train/grad_norm":     train_m["grad_norm"],
                 "val/loss":            val_m["loss"],
                 "val/accuracy":        val_m["accuracy"],
+                "val/signal_score":    score,
                 "val/confidence_mean": val_m["confidence_mean"],
                 "val/sell_precision":  pc["sell"]["precision"],
                 "val/sell_recall":     pc["sell"]["recall"],
@@ -508,12 +535,13 @@ def main(cfg: DictConfig) -> None:
                 "val/buy_recall":      pc["buy"]["recall"],
             })
 
-        if val_m["loss"] < trainer.best_val_loss:
+        score = Trainer._signal_score(val_m["per_class"])
+        if score > trainer.best_signal_score:
             trainer.save_checkpoint(
                 f"{cfg.paths.model_dir}/{cfg.model.name}_best.pt", epoch, val_m
             )
 
-        if trainer.check_early_stopping(val_m["loss"]):
+        if trainer.check_early_stopping(val_m):
             logger.info(f"Early stopping at epoch {epoch}")
             break
 
