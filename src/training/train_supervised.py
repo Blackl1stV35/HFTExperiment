@@ -289,10 +289,11 @@ class Trainer:
 
     @staticmethod
     def signal_score(per_class: dict) -> float:
-        return (
-            per_class["sell"]["recall"] * 0.4
-            + per_class["buy"]["recall"]  * 0.4
-        )
+        def f1(p, r):
+            return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        sell_f1 = f1(per_class["sell"]["precision"], per_class["sell"]["recall"])
+        buy_f1  = f1(per_class["buy"]["precision"],  per_class["buy"]["recall"])
+        return sell_f1 * 0.4 + buy_f1 * 0.4
 
     def load_checkpoint(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device)
