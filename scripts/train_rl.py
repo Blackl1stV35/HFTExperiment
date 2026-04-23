@@ -307,19 +307,45 @@ class FrozenEncoderEnv(gym.Env):
 # Feature extraction helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_model_features(model, X, S, device, batch_size=512):
+from torch.utils.data import Dataset, DataLoader
+
+class SequenceDataset(Dataset):
+    """Sliding-window dataset that avoids pre-allocating the full X array."""
+    def __init__(self, features: np.ndarray, seq_len: int):
+        self.features = features
+        self.seq_len  = seq_len
+        self._n       = len(features) - seq_len
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, i: int):
+        x = torch.from_numpy(self.features[i : i + self.seq_len].copy())
+        return x
+
+def extract_model_features(model, features, seq_len, device, batch_size=2048):
+    """Memory-efficient feature extraction using a sliding window DataLoader."""
     model.eval()
+    
+    # Use the lightweight sliding-window dataset
+    dataset = SequenceDataset(features, seq_len)
+    loader  = DataLoader(dataset, batch_size=batch_size, num_workers=0, shuffle=False)
+    
     all_probs, all_confs = [], []
+    
+    logger.info("Extracting signals batch-by-batch (this takes ~2 mins)...")
     with torch.no_grad():
-        for i in range(0, len(X), batch_size):
-            bx = torch.FloatTensor(X[i:i+batch_size]).to(device)
-            bs = torch.FloatTensor(S[i:i+batch_size]).to(device) if S is not None else None
-            logits, conf = model(bx, bs)
+        for bx in loader:
+            bx = bx.to(device)
+            # Pass None for sentiment (S) since we disabled it
+            logits, conf = model(bx, None) 
             all_probs.append(torch.softmax(logits, dim=-1).cpu().numpy())
             all_confs.append(conf.squeeze(-1).cpu().numpy())
+            
     signals     = np.concatenate(all_probs)
     confidences = np.concatenate(all_confs)
     argmax      = signals.argmax(axis=1)
+    
     logger.info(
         f"Features: {signals.shape} | conf {confidences.mean():.3f}±{confidences.std():.3f} | "
         f"sell={np.mean(argmax==0):.1%} hold={np.mean(argmax==1):.1%} buy={np.mean(argmax==2):.1%}"
@@ -405,17 +431,20 @@ def main():
     close_prices = close_prices[ws:]
     regime_arr  = regime_arr_full[ws:]
 
-    dummy = np.zeros(len(features), dtype=np.int64)
-    X, _, _ = create_sequences(features, dummy, args.seq_length, sentiment=None)
-    seq_prices = close_prices[args.seq_length - 1 : args.seq_length - 1 + len(X)]
-    seq_regime = regime_arr [args.seq_length - 1 : args.seq_length - 1 + len(X)]
+    # 1. Calculate how many sequences we WILL have
+    n_seqs = len(features) - args.seq_length
+
+    # 2. Slice the trailing arrays directly (no more create_sequences!)
+    seq_prices = close_prices[args.seq_length - 1 : args.seq_length - 1 + n_seqs]
+    seq_regime = regime_arr  [args.seq_length - 1 : args.seq_length - 1 + n_seqs]
+    
     # regime cols: gmm2=0, km=1, vol=2, gs=3, cu=4, rq=5
     seq_gmm2   = seq_regime[:, 0]
     seq_gs     = seq_regime[:, 3]
     seq_cu     = seq_regime[:, 4]
     seq_rq     = seq_regime[:, 5]
 
-    logger.info(f"Sequences: {len(X):,} | GMM2 Bull={seq_gmm2.mean():.1%} | "
+    logger.info(f"Sequences: {n_seqs:,} | GMM2 Bull={seq_gmm2.mean():.1%} | "
                 f"G/S Q1={np.mean(seq_gs<=0.25):.1%} Q4={np.mean(seq_gs>=0.75):.1%}")
 
     # Load frozen model
@@ -428,7 +457,8 @@ def main():
     for p in model.parameters(): p.requires_grad = False
     logger.info(f"Frozen model loaded: {sum(p.numel() for p in model.parameters()):,} params")
 
-    signals, confidences = extract_model_features(model, X, None, device)
+    # 3. Stream the raw features through the model efficiently
+    signals, confidences = extract_model_features(model, features, args.seq_length, device)
 
     # Compute v4 obs features
     try:
