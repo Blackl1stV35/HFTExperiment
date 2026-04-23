@@ -42,6 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 import torch
 from loguru import logger
 
@@ -307,40 +308,39 @@ class FrozenEncoderEnv(gym.Env):
 # Feature extraction helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-from torch.utils.data import Dataset, DataLoader
-
-class SequenceDataset(Dataset):
-    """Sliding-window dataset that avoids pre-allocating the full X array."""
-    def __init__(self, features: np.ndarray, seq_len: int):
-        self.features = features
-        self.seq_len  = seq_len
-        self._n       = len(features) - seq_len
-
-    def __len__(self) -> int:
-        return self._n
-
-    def __getitem__(self, i: int):
-        x = torch.from_numpy(self.features[i : i + self.seq_len].copy())
-        return x
-
 def extract_model_features(model, features, seq_len, device, batch_size=2048):
-    """Memory-efficient feature extraction using a sliding window DataLoader."""
+    """Ultra-fast, zero-RAM-overhead feature extraction using NumPy strides."""
     model.eval()
     
-    # Use the lightweight sliding-window dataset
-    dataset = SequenceDataset(features, seq_len)
-    loader  = DataLoader(dataset, batch_size=batch_size, num_workers=0, shuffle=False)
+    # 1. Create a zero-memory-cost sliding window view
+    # Shape becomes: (N - seq_len + 1, 6, seq_len)
+    windows = sliding_window_view(features, window_shape=seq_len, axis=0)
+    
+    # 2. Drop the last item to perfectly match your original N - seq_len shape
+    windows = windows[:-1]
+    
+    # 3. Swap axes to match PyTorch expectations: (N, seq_len, features)
+    windows = np.swapaxes(windows, 1, 2)
     
     all_probs, all_confs = [], []
+    n_batches = len(windows) // batch_size + (1 if len(windows) % batch_size != 0 else 0)
     
-    logger.info("Extracting signals batch-by-batch (this takes ~2 mins)...")
+    logger.info(f"Extracting signals across {n_batches} batches using stride tricks...")
+    
     with torch.no_grad():
-        for bx in loader:
-            bx = bx.to(device)
-            # Pass None for sentiment (S) since we disabled it
+        for i in range(0, len(windows), batch_size):
+            # Slicing the view and using contiguous memory is blazing fast for batches
+            batch_np = np.ascontiguousarray(windows[i : i + batch_size])
+            bx = torch.FloatTensor(batch_np).to(device)
+            
             logits, conf = model(bx, None) 
+            
             all_probs.append(torch.softmax(logits, dim=-1).cpu().numpy())
             all_confs.append(conf.squeeze(-1).cpu().numpy())
+            
+            # Print progress every 500 batches so you know it isn't frozen
+            if (i // batch_size) % 500 == 0:
+                logger.info(f"Processed {(i // batch_size)} / {n_batches} batches...")
             
     signals     = np.concatenate(all_probs)
     confidences = np.concatenate(all_confs)
