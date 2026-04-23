@@ -1,32 +1,45 @@
-"""Data preprocessing: scaling, feature extraction, and regime label joining.
+"""Data preprocessing — Phase 3 consolidated module.
 
-Phase 3 additions:
-    join_regime_labels() — left-joins daily_regime_labels.csv onto M1 bars
-    by date, forward-filling across intraday bars. Adds 6 columns that the
-    RL observation vector (obs 10→13) and supervised sampler consume.
+Single import point for all feature preparation the training pipeline needs:
 
-    Columns added per M1 bar:
-        gmm2_state          int   0=Bear 1=Bull (2-state GMM, 5d min-dwell)
-        km_label_63d_enc    float 0.0–1.0 (Regime-A=0.0 … Regime-D=1.0)
-        vol_regime_enc      float 0.0=LOW 0.5=NORMAL 1.0=HIGH
-        gs_quartile_enc     float 0.0=Q1(silver-leads) … 1.0=Q4(gold-leads)
-        cu_au_regime_enc    float 0.0=Financial 0.5=Mixed 1.0=Commodity
-        regime_quality_norm float [0,1] normalised Sharpe from 2D heatmap
+    prepare_features()        — scale OHLCV+spread for supervised model input
+    join_regime_labels()      — left-join daily_regime_labels.csv onto M1 bars
+    get_regime_array()        — extract (N,6) float32 regime array for RL obs
+    compute_rl_obs_features() — ATR, EMA trend, session-phase arrays (obs 7-9)
+
+Encoding maps (must stay in sync with notebook export):
+    KMeans 63d  — Regime-A=0.0  Regime-B=0.33  Regime-C=0.67  Regime-D=1.0
+    Vol regime  — LOW=0.0  NORMAL=0.5  HIGH=1.0
+    G/S quartile — rank-based [0,1] derived from gs_ratio column
+    Cu-Au regime — Financial=0.0  Mixed=0.5  Commodity=1.0
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import polars as pl
 from loguru import logger
 
 
+# ── Encoding maps ─────────────────────────────────────────────────────────────
+
+_KM_ENC = {
+    "Regime-A (best)":  0.0,
+    "Regime-B":         0.33,
+    "Regime-C":         0.67,
+    "Regime-D (worst)": 1.0,
+}
+_VOL_ENC = {"LOW": 0.0, "NORMAL": 0.5, "HIGH": 1.0}
+_CU_ENC  = {"Financial": 0.0, "Mixed": 0.5, "Commodity": 1.0}
+
+
 # ── Scalers ───────────────────────────────────────────────────────────────────
 
 class WindowMinMaxScaler:
+    """Rolling window min-max scaler. Pricing-agnostic."""
+
     def __init__(self, window_size: int = 120, epsilon: float = 1e-8):
         self.window_size = window_size
         self.epsilon = epsilon
@@ -34,7 +47,7 @@ class WindowMinMaxScaler:
     def transform(self, data: np.ndarray) -> np.ndarray:
         if data.ndim == 1:
             data = data.reshape(-1, 1)
-        n, f = data.shape
+        n = data.shape[0]
         scaled = np.zeros_like(data)
         for i in range(n):
             start = max(0, i - self.window_size + 1)
@@ -46,6 +59,8 @@ class WindowMinMaxScaler:
 
 
 class ZScoreScaler:
+    """Rolling z-score normalisation."""
+
     def __init__(self, window_size: int = 120, epsilon: float = 1e-8):
         self.window_size = window_size
         self.epsilon = epsilon
@@ -53,7 +68,7 @@ class ZScoreScaler:
     def transform(self, data: np.ndarray) -> np.ndarray:
         if data.ndim == 1:
             data = data.reshape(-1, 1)
-        n, f = data.shape
+        n = data.shape[0]
         scaled = np.zeros_like(data)
         for i in range(n):
             start = max(0, i - self.window_size + 1)
@@ -65,149 +80,130 @@ class ZScoreScaler:
 def get_scaler(method: str, window_size: int):
     if method == "window_minmax":
         return WindowMinMaxScaler(window_size)
-    elif method == "zscore":
+    if method == "zscore":
         return ZScoreScaler(window_size)
     raise ValueError(f"Unknown scaler: {method}")
 
 
-# ── Core feature preparation ───────────────────────────────────────────────────
+# ── OHLCV feature preparation ─────────────────────────────────────────────────
 
 def prepare_features(
     df: pl.DataFrame,
     scaler_method: str = "window_minmax",
     window_size: int = 120,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Extract and scale OHLCV+spread features.
+    """Extract and scale OHLCV+spread features from a Polars M1 DataFrame.
 
     Returns:
-        features: (n_samples, 6) scaled OHLCV+spread
-        close_prices: (n_samples,) raw close prices
+        features:     (N, 6) float32  — scaled [open, high, low, close, tick_vol, spread]
+        close_prices: (N,)   float64  — raw close prices for labelling
     """
     df = df.filter(pl.col("timestamp").dt.weekday().is_in([1, 2, 3, 4, 5]))
     for c in ["open", "high", "low", "close"]:
         df = df.with_columns(pl.col(c).forward_fill())
 
     feature_cols = ["open", "high", "low", "close", "tick_volume", "spread"]
-    features = df.select(feature_cols).to_numpy().astype(np.float32)
+    features     = df.select(feature_cols).to_numpy().astype(np.float32)
     close_prices = df["close"].to_numpy()
 
-    scaler = get_scaler(scaler_method, window_size)
-    features_scaled = scaler.transform(features).astype(np.float32)
-    logger.info(f"Features prepared: {features_scaled.shape}")
-    return features_scaled, close_prices
+    scaler  = get_scaler(scaler_method, window_size)
+    scaled  = scaler.transform(features).astype(np.float32)
+    logger.info(f"Features prepared: {scaled.shape}")
+    return scaled, close_prices
 
 
-# ── Step 2: Regime label joining ───────────────────────────────────────────────
-
-# Encoding maps — must match notebook export values
-_KM_ENC = {
-    "Regime-A (best)":  0.0,
-    "Regime-B":         0.33,
-    "Regime-C":         0.67,
-    "Regime-D (worst)": 1.0,
-}
-_VOL_ENC = {"LOW": 0.0, "NORMAL": 0.5, "HIGH": 1.0}
-_CU_ENC  = {"Financial": 0.0, "Mixed": 0.5, "Commodity": 1.0}
-
+# ── Regime label joining (Step 2) ─────────────────────────────────────────────
 
 def join_regime_labels(
     df_m1: pl.DataFrame,
     regime_csv: str | Path,
 ) -> pl.DataFrame:
-    """Left-join daily regime labels onto M1 OHLCV bars.
+    """Left-join daily regime labels onto M1 OHLCV bars by date.
 
-    Reads ``daily_regime_labels.csv`` (produced by the research notebook),
-    extracts date from M1 timestamps, and forward-fills daily values across
-    all intraday bars of each trading day.
+    Reads daily_regime_labels.csv (generated by the research notebook),
+    forward-fills daily values across every intraday bar of each trading day.
 
-    Args:
-        df_m1:      Polars DataFrame with a ``timestamp`` column (M1 bars).
-        regime_csv: Path to ``data/regime/daily_regime_labels.csv``.
+    If the CSV is absent the function returns df_m1 with neutral defaults (0.5)
+    and logs a warning — training still runs, regime obs dims are uninformative.
 
-    Returns:
-        df_m1 with 6 new float32 columns:
-            gmm2_state, km_label_63d_enc, vol_regime_enc,
-            gs_quartile_enc, cu_au_regime_enc, regime_quality_norm
+    Columns added (float32):
+        gmm2_state          — 0.0=Bear  1.0=Bull  (2-state GMM, 5d min-dwell)
+        km_label_63d_enc    — 0.0–1.0  (Regime-A … Regime-D)
+        vol_regime_enc      — 0.0=LOW  0.5=NORMAL  1.0=HIGH
+        gs_quartile_enc     — 0.0=Q1(silver-leads) … 1.0=Q4(gold-leads)
+        cu_au_regime_enc    — 0.0=Financial  0.5=Mixed  1.0=Commodity
+        regime_quality_norm — [0,1] normalised Sharpe from GMM×vol heatmap
     """
     csv_path = Path(regime_csv)
     if not csv_path.exists():
         logger.warning(
-            f"Regime CSV not found at {csv_path}. "
-            "All regime columns will be set to 0.5 (neutral). "
-            "Run the research notebook first to generate daily_regime_labels.csv."
+            f"Regime CSV not found: {csv_path}. "
+            "Regime columns set to neutral defaults. "
+            "Generate it by running notebooks/00_market_regime_explorer_v5.ipynb."
         )
-        n = len(df_m1)
-        return df_m1.with_columns([
-            pl.lit(1.0).cast(pl.Float32).alias("gmm2_state"),
-            pl.lit(0.33).cast(pl.Float32).alias("km_label_63d_enc"),
-            pl.lit(0.5).cast(pl.Float32).alias("vol_regime_enc"),
-            pl.lit(0.0).cast(pl.Float32).alias("gs_quartile_enc"),
-            pl.lit(0.5).cast(pl.Float32).alias("cu_au_regime_enc"),
-            pl.lit(0.5).cast(pl.Float32).alias("regime_quality_norm"),
-        ])
+        return _add_neutral_regime_cols(df_m1)
 
     try:
         import pandas as pd
         daily = pd.read_csv(str(csv_path), index_col=0, parse_dates=True)
-        daily.index = pd.to_datetime(daily.index).normalize()  # date only
+        daily.index = pd.to_datetime(daily.index).normalize()
     except Exception as e:
         logger.error(f"Failed to load regime CSV: {e}")
         return _add_neutral_regime_cols(df_m1)
 
-    # ── Encode categorical columns ─────────────────────────────────────────────
-    # gmm2_state: prefer gmm2_state column; fall back to gmm_state mapping
+    # gmm2_state: prefer explicit 2-state col; fall back by mapping 3-state
     if "gmm2_state" in daily.columns:
         daily["_gmm2"] = daily["gmm2_state"].fillna(1.0).astype(float)
     elif "gmm_state" in daily.columns:
-        # Map 3-state (0=Bear,1=Neutral,2=Bull) → 2-state (0=Bear,1=Bull)
-        daily["_gmm2"] = daily["gmm_state"].map({0.0: 0.0, 1.0: 1.0, 2.0: 1.0}).fillna(1.0)
+        daily["_gmm2"] = (
+            daily["gmm_state"]
+            .map({0.0: 0.0, 1.0: 1.0, 2.0: 1.0})
+            .fillna(1.0)
+        )
     else:
-        daily["_gmm2"] = 1.0  # default Bull (no-restriction)
+        daily["_gmm2"] = 1.0
 
-    daily["_km"] = daily.get("km_label_63d", pd.Series("Regime-B", index=daily.index)).map(
-        _KM_ENC).fillna(0.33)
+    import pandas as pd
+    daily["_km"] = (
+        daily.get("km_label_63d", pd.Series("Regime-B", index=daily.index))
+        .map(_KM_ENC)
+        .fillna(0.33)
+    )
+    daily["_vol"] = (
+        daily.get("vol_regime", pd.Series("NORMAL", index=daily.index))
+        .map(_VOL_ENC)
+        .fillna(0.5)
+    )
 
-    daily["_vol"] = daily.get("vol_regime", pd.Series("NORMAL", index=daily.index)).map(
-        _VOL_ENC).fillna(0.5)
-
-    # G/S quartile: derive from gs_ratio rank or use default Q1 (0.0)
+    # G/S quartile: rank gs_ratio into [0,1]; fall back to Q1 (0.0)
     if "gs_ratio" in daily.columns:
         gs = daily["gs_ratio"].dropna()
-        daily["_gs_q"] = gs.rank(pct=True).apply(
-            lambda r: 0.0 if r <= 0.25 else (0.33 if r <= 0.5 else (0.67 if r <= 0.75 else 1.0))
-        ).reindex(daily.index).fillna(0.0)
+        daily["_gs_q"] = (
+            gs.rank(pct=True)
+            .apply(lambda r: 0.0 if r <= 0.25 else (0.33 if r <= 0.5 else (0.67 if r <= 0.75 else 1.0)))
+            .reindex(daily.index)
+            .fillna(0.0)
+        )
     else:
         daily["_gs_q"] = 0.0
 
-    # Cu-Au regime: derive from xau_vol_ann_pct as a proxy if not present
-    # (The notebook exports vol_regime which captures the same info)
-    daily["_cu"] = 0.5  # default Mixed
-
-    daily["_rq"] = daily.get("regime_quality_norm", pd.Series(0.5, index=daily.index)).fillna(0.5)
-
-    # Select and resample to fill weekends/gaps
-    keep = daily[["_gmm2","_km","_vol","_gs_q","_cu","_rq"]].copy()
-
-    # ── Join to M1 timestamps ──────────────────────────────────────────────────
-    # Extract date from M1 DataFrame
-    df_m1 = df_m1.with_columns(
-        pl.col("timestamp").dt.date().alias("_date")
+    daily["_cu"] = 0.5  # Mixed default (no direct daily Cu-Au column in export)
+    daily["_rq"] = (
+        daily.get("regime_quality_norm", pd.Series(0.5, index=daily.index))
+        .fillna(0.5)
     )
-    dates = df_m1["_date"].to_list()
 
-    # Build lookup dict: date → regime row
-    keep.index = keep.index.date  # drop time component
+    # Build date-keyed lookup for O(1) per-bar access
+    keep = daily[["_gmm2", "_km", "_vol", "_gs_q", "_cu", "_rq"]].copy()
+    keep.index = keep.index.date
     regime_map = keep.to_dict(orient="index")
 
-    # Map each M1 bar's date to regime values; forward-fill missing dates
-    gmm2_vals = []
-    km_vals   = []
-    vol_vals  = []
-    gs_vals   = []
-    cu_vals   = []
-    rq_vals   = []
+    df_m1  = df_m1.with_columns(pl.col("timestamp").dt.date().alias("_date"))
+    dates  = df_m1["_date"].to_list()
 
+    gmm2_v, km_v, vol_v, gs_v, cu_v, rq_v = [], [], [], [], [], []
     last = {"g": 1.0, "k": 0.33, "v": 0.5, "gs": 0.0, "c": 0.5, "r": 0.5}
+
     for d in dates:
         row = regime_map.get(d)
         if row:
@@ -217,28 +213,25 @@ def join_regime_labels(
             last["gs"] = float(row["_gs_q"])
             last["c"]  = float(row["_cu"])
             last["r"]  = float(row["_rq"])
-        gmm2_vals.append(last["g"])
-        km_vals.append(last["k"])
-        vol_vals.append(last["v"])
-        gs_vals.append(last["gs"])
-        cu_vals.append(last["c"])
-        rq_vals.append(last["r"])
+        gmm2_v.append(last["g"]); km_v.append(last["k"])
+        vol_v.append(last["v"]);  gs_v.append(last["gs"])
+        cu_v.append(last["c"]);   rq_v.append(last["r"])
 
     df_m1 = df_m1.drop("_date").with_columns([
-        pl.Series("gmm2_state",       gmm2_vals, dtype=pl.Float32),
-        pl.Series("km_label_63d_enc", km_vals,   dtype=pl.Float32),
-        pl.Series("vol_regime_enc",   vol_vals,  dtype=pl.Float32),
-        pl.Series("gs_quartile_enc",  gs_vals,   dtype=pl.Float32),
-        pl.Series("cu_au_regime_enc", cu_vals,   dtype=pl.Float32),
-        pl.Series("regime_quality_norm", rq_vals, dtype=pl.Float32),
+        pl.Series("gmm2_state",          gmm2_v, dtype=pl.Float32),
+        pl.Series("km_label_63d_enc",    km_v,   dtype=pl.Float32),
+        pl.Series("vol_regime_enc",      vol_v,  dtype=pl.Float32),
+        pl.Series("gs_quartile_enc",     gs_v,   dtype=pl.Float32),
+        pl.Series("cu_au_regime_enc",    cu_v,   dtype=pl.Float32),
+        pl.Series("regime_quality_norm", rq_v,   dtype=pl.Float32),
     ])
 
-    bull_pct = sum(gmm2_vals) / len(gmm2_vals)
+    bull_pct = sum(gmm2_v) / max(len(gmm2_v), 1)
     logger.info(
-        f"Regime labels joined: {len(df_m1):,} M1 bars | "
-        f"Bull {bull_pct:.1%} | "
-        f"Vol enc mean {sum(vol_vals)/len(vol_vals):.2f} | "
-        f"Regime quality mean {sum(rq_vals)/len(rq_vals):.2f}"
+        f"Regime labels joined: {len(df_m1):,} bars | "
+        f"Bull {bull_pct:.1%} Bear {1-bull_pct:.1%} | "
+        f"vol_mean {sum(vol_v)/len(vol_v):.2f} | "
+        f"rq_mean {sum(rq_v)/len(rq_v):.2f}"
     )
     return df_m1
 
@@ -255,7 +248,7 @@ def _add_neutral_regime_cols(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def get_regime_array(df_m1_with_regime: pl.DataFrame) -> np.ndarray:
-    """Extract 6 regime columns as (N, 6) float32 array for RL obs concat."""
+    """Extract 6 regime columns as (N, 6) float32 for RL obs alignment."""
     cols = [
         "gmm2_state", "km_label_63d_enc", "vol_regime_enc",
         "gs_quartile_enc", "cu_au_regime_enc", "regime_quality_norm",
@@ -263,5 +256,62 @@ def get_regime_array(df_m1_with_regime: pl.DataFrame) -> np.ndarray:
     available = [c for c in cols if c in df_m1_with_regime.columns]
     if len(available) < 6:
         logger.warning(f"Only {len(available)}/6 regime cols present — padding with 0.5")
-    arr = df_m1_with_regime.select(available).to_numpy().astype(np.float32)
-    return arr
+    return df_m1_with_regime.select(available).to_numpy().astype(np.float32)
+
+
+# ── RL observation context features (Step 4, merged from feature_engineering) ─
+
+def compute_rl_obs_features(
+    prices: np.ndarray,
+    timestamps,
+    atr_period: int = 14,
+    ema_period: int = 20,
+    ema_lag: int = 5,
+    session_open_utc: float = 8.0,
+    session_range_hrs: float = 13.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute 3 market-context features for RL observation indices 7-9.
+
+    Args:
+        prices:     (N,) close price array aligned to sequence output.
+        timestamps: list[datetime] | None — M1 bar UTC timestamps.
+
+    Returns:
+        atr_norm      (N,) float32 — rolling ATR/close clipped [0, 0.05]
+        trend_norm    (N,) float32 — EMA slope/close*100 clipped [-2, 2]
+        session_phase (N,) float32 — London/NY overlap fraction [0, 1]
+
+    All features use look-back only — no lookahead bias.
+    """
+    n = len(prices)
+    atr_norm      = np.zeros(n, dtype=np.float32)
+    trend_norm    = np.zeros(n, dtype=np.float32)
+    session_phase = np.zeros(n, dtype=np.float32)
+
+    # ATR proxy: rolling price range / close
+    for i in range(atr_period, n):
+        window   = prices[i - atr_period : i + 1]
+        atr_norm[i] = min(float((window.max() - window.min()) / max(prices[i], 1e-8)), 0.05)
+
+    # EMA slope
+    alpha = 2.0 / (ema_period + 1)
+    ema   = np.zeros(n, dtype=np.float64)
+    ema[0] = prices[0]
+    for i in range(1, n):
+        ema[i] = alpha * prices[i] + (1 - alpha) * ema[i - 1]
+    for i in range(ema_lag, n):
+        slope = (ema[i] - ema[i - ema_lag]) / max(prices[i], 1e-8) * 100.0
+        trend_norm[i] = float(np.clip(slope, -2.0, 2.0))
+
+    # Session phase
+    if timestamps is not None:
+        for i, ts in enumerate(timestamps):
+            try:
+                hour = ts.hour + ts.minute / 60.0
+                session_phase[i] = float(np.clip(
+                    (hour - session_open_utc) / session_range_hrs, 0.0, 1.0
+                ))
+            except Exception:
+                session_phase[i] = 0.5
+
+    return atr_norm, trend_norm, session_phase
