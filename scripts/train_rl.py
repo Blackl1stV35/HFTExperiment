@@ -1,28 +1,39 @@
 #!/usr/bin/env python3
-"""Train RL agent on frozen dual-branch supervised model — Phase 3 v2.
+"""Train RL agent on frozen dual-branch supervised model — Phase 3 v3.
 
-Infrastructure (caller's changes, acknowledged):
-    SequenceDataset streams raw (N,6) features through the frozen model
-    in batches instead of pre-allocating (N, seq_len, F) = 16.4 GB.
-    extract_model_features() accepts raw features + DataLoader, logs
-    batch-by-batch progress. Output: signals 68 MB + confidences 22 MB.
-    create_sequences() removed entirely from this script.
+v3 changes (from RL run 2 review):
+    1. episode_len 2000 -> 8000 bars
+       2000 bars => 20-31 closed trades per episode (too few for SAC gradient).
+       8000 bars => 80-120 closed trades per episode => 4x more signal per update.
 
-v2 behaviour changes (from RL run 1 review):
-    1. --steps default 500k -> 1_500_000
-       500k = 250 episodes. SAC needs thousands to converge.
-    2. --n-eval-episodes default 3 -> 15
-       eval PnL std was $381 across run 1 with n=3.
-       Averaging 15 episodes reduces noise by ~2.2x.
-    3. --confidence-gate default 0.48 -> 0.70
-       conf mean = 0.908 in run 1. Gate at 0.48 was inactive
-       (effective scale 0.823 on every trade). Gate at 0.70 creates
-       real differentiation: high-conf (0.95) => 0.83 scale,
-       mid-conf (0.75) => 0.17 scale, low-conf (0.70) => 0.
-    4. Buy-signal reward discount 0.30x in _close_position.
-       Supervised buy F1 = 0.021 on test (near noise). Buy-initiated
-       trades are discounted so the agent learns the sell signal is
-       the reliable edge and does not chase buy noise.
+    2. Signal-strength entry bonus/penalty (direct supervised->RL gradient path)
+       On every new position open, emit an immediate shaped reward based on
+       whether the supervised model agrees with the entry direction:
+         sell_prob > signal_bonus_thresh  and short entry  => +signal_bonus_reward
+         buy_prob  > signal_bonus_thresh  and long  entry  => +signal_bonus_reward
+         counter-signal entry (e.g. long when sell_prob > signal_penalty_thresh) => -signal_penalty_reward
+       This creates gradient in O(1) bars instead of waiting 40-80 bars for
+       the closed-trade reward. With 13.2% sell bars and avg 60-bar hold, the
+       agent previously waited ~60 bars to learn whether an entry was correct.
+       Now it gets immediate feedback at the bar of entry.
+       Defaults: bonus_thresh=0.60, bonus=0.50, penalty_thresh=0.30, penalty=1.00
+
+    3. buy_reward_scale 0.30 -> 1.0 (removed)
+       v2 buy discount may have prevented the agent from learning valid
+       long entries in the XAUUSD uptrend context. The sell signal (F1=0.357)
+       is the primary edge; the entry bonus/penalty now handles signal alignment
+       directly without needing a separate buy discount.
+
+    4. eval_every 8000 -> 16000
+       Longer episodes (8000 bars) means fewer evals per wall-clock time.
+       16k step interval gives ~50 eval checkpoints across 1.5M steps.
+
+v2 changes retained:
+    - steps=1_500_000
+    - n_eval_episodes=15
+    - confidence_gate=0.70
+    - SequenceDataset streaming (no 16.4 GB pre-allocation)
+    - GMM2 Bear entry gate, G/S max_hold, Drive mirroring
 
 Observation (13-dim, unchanged):
     [sell, hold, buy, conf, pos_dir, unreal, hold_t,        idx 0-6
@@ -33,8 +44,11 @@ Usage:
     python scripts/train_rl.py \\
         --checkpoint models/dual_branch_best.pt \\
         --steps 1500000 --seed 42 \\
-        --eval-every 8000 --n-eval-episodes 15 \\
+        --episode-len 8000 \\
+        --eval-every 16000 --n-eval-episodes 15 \\
         --confidence-gate 0.70 \\
+        --signal-bonus-thresh 0.60 --signal-bonus 0.50 \\
+        --signal-penalty-thresh 0.30 --signal-penalty 1.00 \\
         --mtm-scale 0.05 --hold-penalty 0.003 --early-cut-bonus 0.40 \\
         --curriculum-warmup 100000
 """
@@ -67,15 +81,14 @@ from src.utils.logger import setup_logger
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SequenceDataset — OOM fix (caller's infrastructure change)
+# SequenceDataset — OOM fix (retained from v2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SequenceDataset(Dataset):
     """Sliding-window dataset over raw (N, F) features.
 
-    Slices each (seq_len, F) window in __getitem__ rather than
-    pre-allocating the full (N, seq_len, F) array (~16.4 GB).
-    Used only for feature extraction — not for RL env stepping.
+    Slices each (seq_len, F) window in __getitem__ — avoids pre-allocating
+    the full (N, seq_len, F) array (~16.4 GB). Used for feature extraction only.
     """
 
     def __init__(self, features: np.ndarray, seq_len: int):
@@ -88,24 +101,40 @@ class SequenceDataset(Dataset):
         return self._n
 
     def __getitem__(self, i: int) -> torch.Tensor:
-        return torch.from_numpy(
-            self.features[i : i + self.seq_len].copy()
-        )
+        return torch.from_numpy(self.features[i : i + self.seq_len].copy())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Environment
+# Environment — v3
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FrozenEncoderEnv(gym.Env):
     """Trading env driven by pre-extracted frozen model outputs.
 
-    v2 changes:
-        - confidence_gate default raised 0.48 -> 0.70 (fix 3)
-        - Buy-signal reward discount: entry_signal==2 (buy) rewards
-          scaled by buy_reward_scale (default 0.30) because supervised
-          buy F1=0.021 on test is near-noise (fix 4)
-        - entry_signal stored at open to identify buy vs sell trades
+    v3 changes vs v2:
+        episode_len default 2000 -> 8000 (fix 1)
+
+        Signal-strength entry bonus/penalty (fix 2):
+            At the bar of entry, emit an immediate reward based on supervised
+            model agreement. This creates a direct gradient from the frozen
+            signal to the RL policy without waiting 40-80 bars for close.
+
+            Bonus  (+signal_bonus_reward):
+                short entry AND signals[gi, 0] > signal_bonus_thresh  (sell prob high)
+                long  entry AND signals[gi, 2] > signal_bonus_thresh  (buy  prob high)
+
+            Penalty (-signal_penalty_reward):
+                long  entry AND signals[gi, 0] > signal_penalty_thresh (sell dominates, going long)
+                short entry AND signals[gi, 2] > signal_penalty_thresh (buy  dominates, going short)
+
+            Counter-signal entries still happen (agent can override) but carry
+            immediate cost. The agent learns to favour signal-aligned entries
+            through direct gradient rather than through 60-bar delayed close.
+
+        buy_reward_scale removed (fix 3):
+            Entry bonus/penalty handles signal alignment directly.
+            buy_reward_scale=1.0 means no scaling — all closed trades
+            receive full gated reward regardless of entry direction.
 
     Phase 3 obs (13-dim), G/S max_hold, GMM2 entry gate unchanged.
     """
@@ -124,17 +153,21 @@ class FrozenEncoderEnv(gym.Env):
         gs_quartile:    np.ndarray | None = None,
         cu_au_regime:   np.ndarray | None = None,
         gmm2_state:     np.ndarray | None = None,
-        max_hold:           int   = 80,
-        episode_len:        int   = 2000,
-        confidence_gate:    float = 0.70,    # v2: raised from 0.48
-        buy_reward_scale:   float = 0.30,    # v2: discount buy-initiated trades
-        spread_pips:        float = 2.0,
-        pip_value:          float = 0.10,
-        commission_usd:     float = 0.70,
-        initial_balance:    float = 10_000.0,
-        mtm_scale:          float = 0.05,
-        hold_penalty_coeff: float = 0.003,
-        early_cut_bonus_frac: float = 0.40,
+        max_hold:              int   = 80,
+        episode_len:           int   = 8000,    # v3: was 2000
+        confidence_gate:       float = 0.70,
+        # v3 fix 2: signal-strength entry shaping
+        signal_bonus_thresh:   float = 0.60,    # sell/buy prob threshold for bonus
+        signal_bonus_reward:   float = 0.50,    # immediate reward for aligned entry
+        signal_penalty_thresh: float = 0.30,    # threshold for counter-signal penalty
+        signal_penalty_reward: float = 1.00,    # immediate penalty for counter entry
+        spread_pips:           float = 2.0,
+        pip_value:             float = 0.10,
+        commission_usd:        float = 0.70,
+        initial_balance:       float = 10_000.0,
+        mtm_scale:             float = 0.05,
+        hold_penalty_coeff:    float = 0.003,
+        early_cut_bonus_frac:  float = 0.40,
     ):
         super().__init__()
         n = len(prices)
@@ -152,18 +185,21 @@ class FrozenEncoderEnv(gym.Env):
         self.cu_au_regime   = cu_au_regime.astype(np.float32)   if cu_au_regime   is not None else np.full(n, 0.5, np.float32)
         self.gmm2_state     = gmm2_state.astype(np.float32)     if gmm2_state     is not None else np.ones(n, np.float32)
 
-        self._max_hold_default  = max_hold
-        self.episode_len        = min(episode_len, n - 1)
-        self.confidence_gate    = confidence_gate
-        self.buy_reward_scale   = buy_reward_scale
-        self.spread_cost        = spread_pips * pip_value
-        self.commission         = commission_usd
-        self.initial_balance    = initial_balance
-        self.pip_value          = pip_value
-        self.mtm_scale          = mtm_scale
-        self.hold_penalty_coeff = hold_penalty_coeff
-        self.early_cut_bonus_frac = early_cut_bonus_frac
-        self.exit_threshold: float = 0.0
+        self._max_hold_default       = max_hold
+        self.episode_len             = min(episode_len, n - 1)
+        self.confidence_gate         = confidence_gate
+        self.signal_bonus_thresh     = signal_bonus_thresh
+        self.signal_bonus_reward     = signal_bonus_reward
+        self.signal_penalty_thresh   = signal_penalty_thresh
+        self.signal_penalty_reward   = signal_penalty_reward
+        self.spread_cost             = spread_pips * pip_value
+        self.commission              = commission_usd
+        self.initial_balance         = initial_balance
+        self.pip_value               = pip_value
+        self.mtm_scale               = mtm_scale
+        self.hold_penalty_coeff      = hold_penalty_coeff
+        self.early_cut_bonus_frac    = early_cut_bonus_frac
+        self.exit_threshold: float   = 0.0
 
         self.observation_space = spaces.Box(-np.inf, np.inf, (13,), np.float32)
         self.action_space      = spaces.Box(-1.0, 1.0, (2,), np.float32)
@@ -177,7 +213,6 @@ class FrozenEncoderEnv(gym.Env):
         self.position_dir     = 0
         self.entry_price      = 0.0
         self.entry_conf       = 0.0
-        self.entry_signal     = 0     # v2: 0=none 1=sell-initiated 2=buy-initiated
         self.hold_time        = 0
         self.n_trades         = 0
         self.episode_pnl      = 0.0
@@ -205,10 +240,10 @@ class FrozenEncoderEnv(gym.Env):
         return (self._price() - self.entry_price) * self.position_dir / self.pip_value
 
     def _get_obs(self) -> np.ndarray:
-        gi       = self._gi()
-        sig      = self.signals[gi]
-        conf     = self.confidences[gi]
-        unreal   = np.clip(self._unrealized_usd() / 100.0, -5.0, 5.0) if self.position_dir else 0.0
+        gi        = self._gi()
+        sig       = self.signals[gi]
+        conf      = self.confidences[gi]
+        unreal    = np.clip(self._unrealized_usd() / 100.0, -5.0, 5.0) if self.position_dir else 0.0
         hold_frac = min(self.hold_time / max(self.max_hold, 1), 1.0)
         return np.array([
             sig[0], sig[1], sig[2],
@@ -224,6 +259,38 @@ class FrozenEncoderEnv(gym.Env):
             self.cu_au_regime[gi],
         ], dtype=np.float32)
 
+    def _signal_entry_reward(self, gi: int, direction: int) -> float:
+        """v3 fix 2: immediate reward at entry bar based on supervised signal alignment.
+
+        direction: +1 = long, -1 = short.
+
+        Logic:
+            short (+1 dir means price expected to fall i.e. sell signal):
+                signals[gi, 0] = sell prob. High sell prob + short entry => bonus.
+                signals[gi, 2] = buy  prob. High buy  prob + short entry => penalty.
+            long (+1 pos_dir means price expected to rise i.e. buy signal):
+                signals[gi, 2] = buy  prob. High buy  prob + long entry  => bonus.
+                signals[gi, 0] = sell prob. High sell prob + long entry  => penalty.
+
+        Note: in XAUUSD the primary edge is sell (short), not buy (long).
+        The penalty for a counter-signal long entry is larger (1.0) than the
+        bonus (0.5) to reflect the asymmetric signal quality.
+        """
+        sell_prob = float(self.signals[gi, 0])
+        buy_prob  = float(self.signals[gi, 2])
+
+        if direction == -1:   # short entry
+            if sell_prob >= self.signal_bonus_thresh:
+                return self.signal_bonus_reward
+            if buy_prob >= self.signal_penalty_thresh:
+                return -self.signal_penalty_reward
+        else:                 # long entry
+            if buy_prob >= self.signal_bonus_thresh:
+                return self.signal_bonus_reward
+            if sell_prob >= self.signal_penalty_thresh:
+                return -self.signal_penalty_reward
+        return 0.0
+
     def _close_position(self, voluntary: bool = False) -> float:
         if self.position_dir == 0:
             return 0.0
@@ -236,7 +303,7 @@ class FrozenEncoderEnv(gym.Env):
         if pnl_usd > 0:
             self.n_wins += 1
 
-        # Early-cut bonus
+        # Early-cut bonus for cutting losers before max_hold
         early_cut_bonus = 0.0
         if voluntary and pnl_usd < 0 and self.hold_time < self.max_hold * 0.8:
             remaining       = self.max_hold - self.hold_time
@@ -253,41 +320,36 @@ class FrozenEncoderEnv(gym.Env):
 
         gated += early_cut_bonus
 
-        # v2 fix 4: discount buy-initiated trades (buy F1=0.021 on test)
-        # Sell-initiated signal is reliable (F1=0.357); buy is near-noise.
-        # Scaling buy rewards prevents the agent over-exploiting a false signal.
-        if self.entry_signal == 2:
-            gated *= self.buy_reward_scale
+        # v3: buy_reward_scale removed — entry bonus/penalty handles signal alignment
+        # All closed trades receive full gated reward regardless of entry direction.
 
-        # Reset position state
         self.position_dir     = 0
         self.entry_price      = 0.0
         self.entry_conf       = 0.0
-        self.entry_signal     = 0
         self.hold_time        = 0
         self._prev_unrealized = 0.0
         return gated
 
     def step(self, action: np.ndarray):
-        gi         = self._gi()
-        pos_action = float(action[0])
-        exit_logit = float(action[1]) if len(action) > 1 else 0.0
-        reward     = 0.0
+        gi          = self._gi()
+        pos_action  = float(action[0])
+        exit_logit  = float(action[1]) if len(action) > 1 else 0.0
+        reward      = 0.0
         should_exit = exit_logit < self.exit_threshold
 
         self.max_hold = self._gs_max_hold()
 
+        # Force-close at max_hold
         if self.position_dir != 0 and self.hold_time >= self.max_hold:
             reward += self._close_position(voluntary=False)
 
+        # Voluntary exit
         if should_exit and self.position_dir != 0:
             reward += self._close_position(voluntary=True)
 
         in_bull = float(self.gmm2_state[gi]) > 0.5
 
         if not should_exit:
-            sig_argmax = int(self.signals[gi].argmax())   # 0=sell 1=hold 2=buy
-
             if pos_action > 0.0 and self.position_dir != 1:
                 if self.position_dir == -1:
                     reward += self._close_position(voluntary=True)
@@ -295,9 +357,10 @@ class FrozenEncoderEnv(gym.Env):
                     self.position_dir     = 1
                     self.entry_price      = self._price() + self.spread_cost * 0.5
                     self.entry_conf       = self.confidences[gi]
-                    self.entry_signal     = sig_argmax     # track for buy discount
                     self.hold_time        = 0
                     self._prev_unrealized = 0.0
+                    # v3 fix 2: immediate signal-alignment reward at entry
+                    reward += self._signal_entry_reward(gi, direction=1)
 
             elif pos_action < 0.0 and self.position_dir != -1:
                 if self.position_dir == 1:
@@ -306,10 +369,12 @@ class FrozenEncoderEnv(gym.Env):
                     self.position_dir     = -1
                     self.entry_price      = self._price() - self.spread_cost * 0.5
                     self.entry_conf       = self.confidences[gi]
-                    self.entry_signal     = sig_argmax
                     self.hold_time        = 0
                     self._prev_unrealized = 0.0
+                    # v3 fix 2: immediate signal-alignment reward at entry
+                    reward += self._signal_entry_reward(gi, direction=-1)
 
+        # Per-step holding rewards
         if self.position_dir != 0:
             self.hold_time += 1
             cur_unreal  = self._unrealized_usd()
@@ -346,21 +411,18 @@ class FrozenEncoderEnv(gym.Env):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature extraction — SequenceDataset streaming (caller's change)
+# Feature extraction — SequenceDataset streaming (retained from v2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_model_features(
     model,
-    features:   np.ndarray,   # (N, F) raw scaled features
-    seq_len:    int,
-    device:     torch.device,
-    batch_size: int = 2048,
+    features:    np.ndarray,
+    seq_len:     int,
+    device:      torch.device,
+    batch_size:  int = 2048,
     num_workers: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Stream raw features through frozen model via SequenceDataset.
-
-    Avoids pre-allocating (N, seq_len, F) array. Each batch is
-    (batch_size, seq_len, F) assembled on-the-fly by the DataLoader.
 
     Returns:
         signals:     (N - seq_len, 3) softmax probabilities
@@ -369,9 +431,8 @@ def extract_model_features(
     ds     = SequenceDataset(features, seq_len)
     loader = DataLoader(ds, batch_size=batch_size, num_workers=num_workers,
                         pin_memory=False, shuffle=False)
-    n_batches   = len(loader)
-    all_probs   = []
-    all_confs   = []
+    n_batches = len(loader)
+    all_probs, all_confs = [], []
 
     model.eval()
     logger.info(f"Extracting signals across {n_batches} batches using stride tricks...")
@@ -396,15 +457,11 @@ def extract_model_features(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Evaluation — v2: n_episodes configurable (was hardcoded 3)
+# Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate(agent, env, n_episodes: int = 15) -> tuple[float, float, float]:
-    """Average eval over n_episodes random windows from the eval split.
-
-    v2: default raised from 3 to 15 to reduce single-window noise.
-    eval PnL std was $381 with n=3; n=15 reduces that to ~$98.
-    """
+    """Average PnL/trades/WR over n_episodes random windows from the eval split."""
     total_pnl = 0.0; total_trades = 0; total_wins = 0
     for _ in range(n_episodes):
         obs, _ = env.reset()
@@ -426,22 +483,31 @@ def evaluate(agent, env, n_episodes: int = 15) -> tuple[float, float, float]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phase 3 RL v2 (obs=13, G/S hold, GMM2 gate, buy discount)"
+        description="Phase 3 RL v3 (8k episodes, signal entry bonus/penalty)"
     )
     parser.add_argument("--data-dir",            default="data")
     parser.add_argument("--symbol",              default="XAUUSD")
     parser.add_argument("--checkpoint",          default="models/dual_branch_best.pt")
-    parser.add_argument("--steps",      type=int, default=1_500_000)   # v2: was 500k
-    parser.add_argument("--max-hold",   type=int, default=80)
-    parser.add_argument("--episode-len",type=int, default=2000)
-    parser.add_argument("--confidence-gate", type=float, default=0.70)  # v2: was 0.48
-    parser.add_argument("--buy-reward-scale",type=float, default=0.30)  # v2: new
-    parser.add_argument("--n-eval-episodes", type=int,   default=15)    # v2: was 3
+    parser.add_argument("--steps",     type=int, default=1_500_000)
+    parser.add_argument("--max-hold",  type=int, default=80)
+    parser.add_argument("--episode-len",type=int,default=8000)         # v3: was 2000
+    parser.add_argument("--confidence-gate",       type=float,default=0.70)
+    # v3 fix 2: signal-strength entry shaping
+    parser.add_argument("--signal-bonus-thresh",   type=float,default=0.60,
+                        help="sell/buy prob threshold for entry bonus reward")
+    parser.add_argument("--signal-bonus",          type=float,default=0.50,
+                        help="immediate reward for signal-aligned entry")
+    parser.add_argument("--signal-penalty-thresh", type=float,default=0.30,
+                        help="threshold for counter-signal entry penalty")
+    parser.add_argument("--signal-penalty",        type=float,default=1.00,
+                        help="immediate penalty for counter-signal entry")
+    # v3 fix 4: raise eval interval to match longer episodes
+    parser.add_argument("--n-eval-episodes", type=int,  default=15)
+    parser.add_argument("--eval-every",      type=int,  default=16_000)  # v3: was 8k
     parser.add_argument("--seq-length",  type=int, default=120)
     parser.add_argument("--window-size", type=int, default=120)
     parser.add_argument("--seed",        type=int, default=42)
     parser.add_argument("--save-dir",    default="models")
-    parser.add_argument("--eval-every",  type=int, default=8_000)
     parser.add_argument("--device",      default="auto")
     parser.add_argument("--mtm-scale",          type=float, default=0.05)
     parser.add_argument("--hold-penalty",        type=float, default=0.003)
@@ -474,17 +540,16 @@ def main():
         logger.error("No data. Run: python scripts/download_data.py"); sys.exit(1)
 
     df = join_regime_labels(df, args.regime_csv)
-
-    regime_arr_full = get_regime_array(df)   # (N_bars, 6): gmm2,km,vol,gs,cu,rq
+    regime_arr_full = get_regime_array(df)  # (N_bars, 6): gmm2,km,vol,gs,cu,rq
 
     features, close_prices = prepare_features(df, window_size=args.window_size)
-    ws = args.window_size
+    ws           = args.window_size
     features     = features[ws:]
     close_prices = close_prices[ws:]
     regime_arr   = regime_arr_full[ws:]
 
-    # Align seq-level arrays without building the full X array (caller's change)
-    sl = args.seq_length
+    # Align seq-level arrays — no full X array built
+    sl         = args.seq_length
     n_seq      = len(features) - sl
     seq_prices = close_prices[sl - 1 : sl - 1 + n_seq]
     seq_regime = regime_arr  [sl - 1 : sl - 1 + n_seq]
@@ -509,15 +574,15 @@ def main():
         p.requires_grad = False
     logger.info(f"Frozen model: {sum(p.numel() for p in model.parameters()):,} params")
 
-    # ── Feature extraction via SequenceDataset streaming ─────────────────────
+    # ── Feature extraction ────────────────────────────────────────────────────
     signals, confidences = extract_model_features(
         model, features, sl, device, batch_size=args.batch_size
     )
 
     # ── v4 obs context features ───────────────────────────────────────────────
     try:
-        raw_ts  = df["timestamp"].to_list() if "timestamp" in df.columns else None
-        seq_ts  = raw_ts[ws + sl - 1 : ws + sl - 1 + len(signals)] if raw_ts else None
+        raw_ts = df["timestamp"].to_list() if "timestamp" in df.columns else None
+        seq_ts = raw_ts[ws + sl - 1 : ws + sl - 1 + len(signals)] if raw_ts else None
         if seq_ts and len(seq_ts) < len(signals):
             seq_ts = None
     except Exception:
@@ -540,13 +605,16 @@ def main():
             gs_quartile    = seq_gs[sl_idx:su_idx],
             cu_au_regime   = seq_cu[sl_idx:su_idx],
             gmm2_state     = seq_gmm2[sl_idx:su_idx],
-            max_hold            = args.max_hold,
-            episode_len         = args.episode_len,
-            confidence_gate     = args.confidence_gate,
-            buy_reward_scale    = args.buy_reward_scale,
-            mtm_scale           = args.mtm_scale,
-            hold_penalty_coeff  = args.hold_penalty,
-            early_cut_bonus_frac= args.early_cut_bonus,
+            max_hold              = args.max_hold,
+            episode_len           = args.episode_len,
+            confidence_gate       = args.confidence_gate,
+            signal_bonus_thresh   = args.signal_bonus_thresh,
+            signal_bonus_reward   = args.signal_bonus,
+            signal_penalty_thresh = args.signal_penalty_thresh,
+            signal_penalty_reward = args.signal_penalty,
+            mtm_scale             = args.mtm_scale,
+            hold_penalty_coeff    = args.hold_penalty,
+            early_cut_bonus_frac  = args.early_cut_bonus,
         )
 
     train_env = make_env(0, split)
@@ -559,10 +627,13 @@ def main():
         curriculum_warmup_steps=args.curriculum_warmup,
     )
     logger.info(
-        f"Phase 3 SAC agent v2: obs=13 | steps={args.steps:,}\n"
-        f"  confidence_gate={args.confidence_gate} (was 0.48)\n"
-        f"  buy_reward_scale={args.buy_reward_scale} (sell F1=0.357, buy F1=0.021)\n"
-        f"  n_eval_episodes={args.n_eval_episodes} (was 3)\n"
+        f"Phase 3 SAC agent v3: obs=13 | steps={args.steps:,}\n"
+        f"  episode_len={args.episode_len} bars (~{args.episode_len//60:.0f}h, "
+        f"est. {args.episode_len*0.132:.0f} sell signals/ep)\n"
+        f"  signal_bonus:  sell/buy_prob > {args.signal_bonus_thresh} => +{args.signal_bonus:.2f} at entry\n"
+        f"  signal_penalty: counter-signal_prob > {args.signal_penalty_thresh} => -{args.signal_penalty:.2f} at entry\n"
+        f"  confidence_gate={args.confidence_gate} | eval_every={args.eval_every:,} | "
+        f"n_eval_ep={args.n_eval_episodes}\n"
         f"  G/S max_hold: Q1=40 Q2/3=60 Q4=80 | GMM2 Bear entry gate ON\n"
         f"  Curriculum warmup: {args.curriculum_warmup:,} steps"
     )
@@ -622,7 +693,7 @@ def main():
     )
     logger.info(
         f"\n{'='*60}\n"
-        f"PHASE 3 RL v2 TRAINING COMPLETE\n"
+        f"PHASE 3 RL v3 TRAINING COMPLETE\n"
         f"{'='*60}\n"
         f"Steps:          {args.steps:,}\n"
         f"Episodes:       {ep_count}\n"
