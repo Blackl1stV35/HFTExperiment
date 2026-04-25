@@ -1,212 +1,129 @@
-"""Multi-scale CNN/TCN price branch with InceptionTime-style residual blocks.
+"""Price branch encoder — Phase 3 v2 (CCSO two-stage architecture).
 
-Processes OHLCV+spread tick data through parallel convolutions at multiple
-scales (3/5/7/11 bar kernels), capturing microstructure patterns, swing
-patterns, and trend structure simultaneously.
+Architecture per CCSO §1.2–1.3:
+    Stage 1 — Cross-feature Conv1d  (inter-sequence, feature-axis)
+    Stage 2 — Local Attention       (temporal, window w≈20 M1 bars)
 
-Architecture:
-    Input (batch, seq, 6) → InceptionBlock × N → ResidualTCN → LayerNorm → output (batch, d_model)
+CCSO ablation (their Figure 3) shows performance peaks then degrades
+as attention window grows beyond the regime-typical pattern length.
+Default w=20; sweep as hyperparameter.
+
+Sessa alternative: see price_branch_sessa.py for the power-law memory
+tail mixer that outperforms standard attention in diffuse/noisy regimes.
 """
 
 from __future__ import annotations
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class InceptionBlock(nn.Module):
-    """InceptionTime-style multi-scale convolution block.
+class CrossFeatureConv(nn.Module):
+    """Stage 1: conv along the feature axis.
 
-    Runs 4 parallel conv branches at different kernel sizes, concatenates,
-    then projects down. Captures patterns at 3-bar, 5-bar, 7-bar, and
-    11-bar horizons simultaneously.
+    Learns which OHLCV combinations matter (bid-ask × volume relationships
+    are roughly stable intra-day) before attending over time.
     """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int = 64,
-        kernel_sizes: list[int] = [3, 5, 7, 11],
-        dropout: float = 0.2,
-    ):
+    def __init__(self, in_features: int, hidden: int, dropout: float = 0.1):
         super().__init__()
-        n_branches = len(kernel_sizes)
-        branch_ch = max(out_channels // n_branches, 16)
-
-        self.branches = nn.ModuleList()
-        for ks in kernel_sizes:
-            self.branches.append(nn.Sequential(
-                nn.Conv1d(in_channels, branch_ch, kernel_size=ks, padding=ks // 2, bias=False),
-                nn.BatchNorm1d(branch_ch),
-                nn.GELU(),
-            ))
-
-        # Max-pool branch for downsampled view
-        self.pool_branch = nn.Sequential(
-            nn.MaxPool1d(kernel_size=3, stride=1, padding=1),
-            nn.Conv1d(in_channels, branch_ch, kernel_size=1, bias=False),
-            nn.BatchNorm1d(branch_ch),
-            nn.GELU(),
-        )
-
-        total_ch = branch_ch * (n_branches + 1)  # conv branches + pool branch
-
-        # 1x1 projection to target dimension
-        self.projection = nn.Sequential(
-            nn.Conv1d(total_ch, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm1d(out_channels),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-        # Residual connection
-        self.residual = (
-            nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False)
-            if in_channels != out_channels
-            else nn.Identity()
-        )
+        self.norm = nn.LayerNorm(in_features)
+        # Conv1d with kernel=1 mixes features at each time step
+        self.fc1  = nn.Linear(in_features, hidden * 2)
+        self.fc2  = nn.Linear(hidden * 2, hidden)
+        self.drop = nn.Dropout(dropout)
+        self.proj = nn.Linear(in_features, hidden) if in_features != hidden else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch, channels, seq_len) → (batch, out_channels, seq_len)"""
-        branch_outputs = [branch(x) for branch in self.branches]
-        branch_outputs.append(self.pool_branch(x))
-        concat = torch.cat(branch_outputs, dim=1)
-        out = self.projection(concat)
-        return out + self.residual(x)
+        # x: (B, T, F)
+        residual = self.proj(x)
+        x = self.norm(x)
+        x = F.gelu(self.fc1(x))
+        x = self.drop(self.fc2(x))
+        return x + residual
 
 
-class CausalTCNBlock(nn.Module):
-    """Causal temporal convolution block with dilation and residual."""
+class LocalCausalAttention(nn.Module):
+    """Stage 2: causal local attention with window w.
 
-    def __init__(
-        self,
-        channels: int,
-        kernel_size: int = 3,
-        dilation: int = 1,
-        dropout: float = 0.2,
-    ):
+    CCSO: use sliding-window mask with w≈20 for 240-step time-series.
+    Complexity drops O(n²) → O(n·w²). Causal (no future leak).
+    """
+    def __init__(self, d_model: int, n_heads: int = 4,
+                 window: int = 20, dropout: float = 0.1):
         super().__init__()
-        padding = (kernel_size - 1) * dilation  # causal: left-pad only
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.window  = window
+        self.d_k     = d_model // n_heads
 
-        self.conv1 = nn.Conv1d(
-            channels, channels, kernel_size, dilation=dilation, padding=padding, bias=False
-        )
-        self.conv2 = nn.Conv1d(
-            channels, channels, kernel_size, dilation=dilation, padding=padding, bias=False
-        )
-        self.norm1 = nn.BatchNorm1d(channels)
-        self.norm2 = nn.BatchNorm1d(channels)
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-        self.causal_trim = padding  # trim right side to enforce causality
+        self.q = nn.Linear(d_model, d_model, bias=False)
+        self.k = nn.Linear(d_model, d_model, bias=False)
+        self.v = nn.Linear(d_model, d_model, bias=False)
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch, channels, seq_len) → (batch, channels, seq_len)"""
+        # x: (B, T, D)
+        B, T, D = x.shape
         residual = x
-        out = self.act(self.norm1(self.conv1(x)))
-        if self.causal_trim > 0:
-            out = out[:, :, :-self.causal_trim]
-        out = self.dropout(out)
-        out = self.act(self.norm2(self.conv2(out)))
-        if self.causal_trim > 0:
-            out = out[:, :, :-self.causal_trim]
-        out = self.dropout(out)
-        return out + residual
+        x = self.norm(x)
+
+        Q = self.q(x).view(B, T, self.n_heads, self.d_k).transpose(1, 2)  # (B,H,T,dk)
+        K = self.k(x).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
+        V = self.v(x).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)  # (B,H,T,T)
+
+        # Causal local mask: allow only positions i-window <= j <= i
+        mask = torch.full((T, T), float('-inf'), device=x.device)
+        for i in range(T):
+            lo = max(0, i - self.window + 1)
+            mask[i, lo : i + 1] = 0.0
+        scores = scores + mask.unsqueeze(0).unsqueeze(0)
+
+        attn = self.drop(torch.softmax(scores, dim=-1))
+        out  = torch.matmul(attn, V)                     # (B,H,T,dk)
+        out  = out.transpose(1, 2).contiguous().view(B, T, D)
+        return residual + self.out(out)
 
 
 class PriceBranch(nn.Module):
-    """Multi-scale CNN/TCN encoder for OHLCV+spread price data.
+    """Two-stage price encoder: CrossFeatureConv → LocalCausalAttention.
 
-    Architecture:
-        Input → InceptionBlock (multi-scale) → InceptionBlock (deeper)
-        → CausalTCN stack (temporal with exponential dilation)
-        → LayerNorm → Global attention pooling → output
-
-    The InceptionTime blocks extract local patterns at multiple scales,
-    then the TCN stack models longer-range causal dependencies with
-    exponentially increasing receptive field.
+    Args:
+        in_features: OHLCV feature dim (default 6)
+        hidden_dim:  internal representation dim (default 128)
+        n_layers:    number of attention layers (default 2)
+        n_heads:     attention heads (default 4)
+        attn_window: local attention window in M1 bars (default 20)
+        dropout:     applied in both stages (default 0.1)
     """
-
     def __init__(
         self,
-        input_dim: int = 6,
-        inception_channels: int = 128,
-        n_inception_blocks: int = 2,
-        kernel_sizes: list[int] = [3, 5, 7, 11],
-        tcn_layers: int = 4,
-        tcn_kernel_size: int = 3,
-        dropout: float = 0.2,
-        d_model: int = 192,
+        in_features: int = 6,
+        hidden_dim:  int = 128,
+        n_layers:    int = 2,
+        n_heads:     int = 4,
+        attn_window: int = 20,
+        dropout:     float = 0.1,
     ):
         super().__init__()
-        self.d_model = d_model
-
-        # Multi-scale inception blocks
-        inception = []
-        in_ch = input_dim
-        for i in range(n_inception_blocks):
-            inception.append(InceptionBlock(in_ch, inception_channels, kernel_sizes, dropout))
-            in_ch = inception_channels
-        self.inception = nn.Sequential(*inception)
-
-        # Project to d_model if needed
-        self.channel_proj = (
-            nn.Conv1d(inception_channels, d_model, kernel_size=1, bias=False)
-            if inception_channels != d_model
-            else nn.Identity()
-        )
-
-        # Causal TCN with exponential dilation
-        self.tcn = nn.Sequential(*[
-            CausalTCNBlock(d_model, tcn_kernel_size, dilation=2**i, dropout=dropout)
-            for i in range(tcn_layers)
+        self.stage1 = CrossFeatureConv(in_features, hidden_dim, dropout)
+        self.stage2 = nn.ModuleList([
+            LocalCausalAttention(hidden_dim, n_heads, attn_window, dropout)
+            for _ in range(n_layers)
         ])
+        self.pool = nn.AdaptiveAvgPool1d(1)   # global pooling → (B, D)
+        self.out_dim = hidden_dim
 
-        self.norm = nn.LayerNorm(d_model)
-
-        # Attention pooling: learn which timesteps matter most
-        self.attn_pool = nn.Sequential(
-            nn.Linear(d_model, d_model // 4),
-            nn.Tanh(),
-            nn.Linear(d_model // 4, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: (batch, seq_len, input_dim) — OHLCV+spread
-
-        Returns:
-            pooled: (batch, d_model) — global representation
-            seq_features: (batch, seq_len, d_model) — per-timestep features (for cross-attention)
-        """
-        # Conv layers expect (batch, channels, seq_len)
-        x = x.permute(0, 2, 1)
-
-        # Multi-scale feature extraction
-        x = self.inception(x)
-        x = self.channel_proj(x)
-
-        # Causal temporal modeling
-        x = self.tcn(x)
-
-        # Back to (batch, seq_len, d_model)
-        x = x.permute(0, 2, 1)
-        seq_features = self.norm(x)
-
-        # Attention-weighted pooling
-        attn_scores = self.attn_pool(seq_features).squeeze(-1)  # (batch, seq_len)
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        pooled = (seq_features * attn_weights.unsqueeze(-1)).sum(dim=1)  # (batch, d_model)
-
-        return pooled, seq_features
-
-    def receptive_field(self) -> int:
-        """Calculate effective receptive field of the TCN stack."""
-        tcn_layers = len(self.tcn)
-        ks = 3
-        rf = 1
-        for i in range(tcn_layers):
-            rf += 2 * (ks - 1) * (2 ** i)
-        return rf
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, F)
+        x = self.stage1(x)           # (B, T, hidden)
+        for layer in self.stage2:
+            x = layer(x)             # (B, T, hidden)
+        # Pool over time → (B, hidden)
+        x = self.pool(x.transpose(1, 2)).squeeze(-1)
+        return x

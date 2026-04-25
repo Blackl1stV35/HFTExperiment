@@ -23,4 +23,3 @@ multirun/
 .DS_Store
 *.ipynb_checkpoints/
 rust_inference/target/
-*.ipynb
