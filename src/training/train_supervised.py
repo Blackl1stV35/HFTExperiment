@@ -217,15 +217,16 @@ def build_regime_balanced_sampler(
     if timestamps is not None and len(timestamps) == n:
         import pandas as pd
         ts = pd.to_datetime(timestamps)
-        # Guard: timestamps may arrive as a numpy datetime64 array or a pandas
-        # Series/DatetimeIndex — normalise to a plain bool numpy array in all cases.
-        cutoff  = pd.Timestamp("2020-01-01")
-        if hasattr(ts, "to_numpy"):
-            # pandas Series or DatetimeIndex
+        cutoff = pd.Timestamp("2020-01-01")
+
+        if isinstance(ts, (pd.Series, pd.Index)):
+            # pandas objects → safe to_numpy()
             pre2020 = (ts < cutoff).to_numpy()
         else:
-            # already numpy datetime64 — compare via pandas Timestamp.value
-            pre2020 = ts.astype("datetime64[ns]") < np.datetime64(cutoff)
+            # numpy datetime64 array → compare directly
+            ts = ts.astype("datetime64[ns]")
+            pre2020 = ts < np.datetime64(cutoff)
+
         pre2020 = pre2020.astype(bool)
         regime_mult[pre2020] *= 1.5
         logger.info(f"Temporal reweighting: pre-2020={pre2020.sum():,} x1.5")
@@ -294,17 +295,15 @@ class Trainer:
 
     @staticmethod
     def signal_score(per_class: dict) -> float:
-        """F1-based checkpoint metric — zero when precision is zero.
-
-        Replaces sell_R*0.4 + buy_R*0.4 which rewarded high recall regardless
-        of precision. A model predicting sell on every bar gets sell_R=1.0 but
-        P=0.02, F1=0.04, score=0.016 — correctly ranked below a balanced model.
-        """
-        def f1(p, r):
-            return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-
-        sell_f1 = f1(per_class["sell"]["precision"], per_class["sell"]["recall"])
-        buy_f1  = f1(per_class["buy"]["precision"],  per_class["buy"]["recall"])
+        sp = per_class["sell"]["precision"]
+        sr = per_class["sell"]["recall"]
+        # Hard floor: don't save unless sell precision >= 0.30
+        if sp < 0.30:
+            return 0.0
+        sell_f1 = 2 * sp * sr / (sp + sr) if (sp + sr) > 0 else 0.0
+        buy_p = per_class["buy"]["precision"]
+        buy_r = per_class["buy"]["recall"]
+        buy_f1 = 2 * buy_p * buy_r / (buy_p + buy_r) if (buy_p + buy_r) > 0 else 0.0
         return sell_f1 * 0.4 + buy_f1 * 0.4
 
     def load_checkpoint(self, path: str) -> None:
