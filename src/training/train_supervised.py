@@ -215,15 +215,20 @@ def build_regime_balanced_sampler(
         regime_mult[gmm2 == 0] = 2.0
 
     if timestamps is not None and len(timestamps) == n:
-            import pandas as pd
-            ts      = pd.to_datetime(timestamps)
-            cutoff  = pd.Timestamp("2020-01-01")
-            # pd.to_datetime on a list returns DatetimeIndex (no .to_numpy on the
-            # boolean result); on a Series it returns Series (has .to_numpy).
-            # np.asarray works on both and avoids the datetime64 ufunc mismatch.
-            pre2020 = np.asarray(ts < cutoff, dtype=bool)
-            regime_mult[pre2020] *= 1.5
-            logger.info(f"Temporal reweighting: pre-2020={pre2020.sum():,} x1.5")
+        import pandas as pd
+        ts = pd.to_datetime(timestamps)
+        # Guard: timestamps may arrive as a numpy datetime64 array or a pandas
+        # Series/DatetimeIndex — normalise to a plain bool numpy array in all cases.
+        cutoff  = pd.Timestamp("2020-01-01")
+        if hasattr(ts, "to_numpy"):
+            # pandas Series or DatetimeIndex
+            pre2020 = (ts < cutoff).to_numpy()
+        else:
+            # already numpy datetime64 — compare via pandas Timestamp.value
+            pre2020 = ts.astype("datetime64[ns]") < np.datetime64(cutoff)
+        pre2020 = pre2020.astype(bool)
+        regime_mult[pre2020] *= 1.5
+        logger.info(f"Temporal reweighting: pre-2020={pre2020.sum():,} x1.5")
 
     final_weights     = torch.FloatTensor(sample_weights * regime_mult)
     actual_epoch_size = min(epoch_size, n)
@@ -289,8 +294,15 @@ class Trainer:
 
     @staticmethod
     def signal_score(per_class: dict) -> float:
+        """F1-based checkpoint metric — zero when precision is zero.
+
+        Replaces sell_R*0.4 + buy_R*0.4 which rewarded high recall regardless
+        of precision. A model predicting sell on every bar gets sell_R=1.0 but
+        P=0.02, F1=0.04, score=0.016 — correctly ranked below a balanced model.
+        """
         def f1(p, r):
             return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+
         sell_f1 = f1(per_class["sell"]["precision"], per_class["sell"]["recall"])
         buy_f1  = f1(per_class["buy"]["precision"],  per_class["buy"]["recall"])
         return sell_f1 * 0.4 + buy_f1 * 0.4
@@ -486,10 +498,8 @@ def main(cfg: DictConfig) -> None:
         emb_path = Path(cfg.paths.data_dir) / "sentiment_embeddings.npy"
         if emb_path.exists():
             all_emb = np.load(str(emb_path), allow_pickle=True)
-            if isinstance(all_emb, np.ndarray) and all_emb.ndim == 2 and all_emb.shape[0] > ws:
+            if isinstance(all_emb, np.ndarray) and all_emb.ndim == 2:
                 sentiment = all_emb[ws:]
-            else:
-                logger.warning("Sentiment embeddings not usable — skipping.")
 
     # ── Fix 4: Regime-stratified split ────────────────────────────────────────
     seq_len = cfg.model.input.sequence_length
@@ -642,17 +652,12 @@ def main(cfg: DictConfig) -> None:
     # ── Test ──────────────────────────────────────────────────────────────────
     test_m     = trainer.validate(test_loader)
     pc_t       = test_m["per_class"]
-    try:
-        test_score = Trainer.signal_score(pc_t)
-    except Exception as e:
-        logger.error(f"Signal score computation failed: {e}")
-        test_score = 0.0
-
+    test_score = Trainer.signal_score(pc_t)
     logger.info(
         f"Test: loss={test_m['loss']:.4f} acc={test_m['accuracy']:.4f} | "
         f"SignalScore={test_score:.4f} | "
-        f"sell P={pc_t.get('sell',{}).get('precision',0):.3f} R={pc_t.get('sell',{}).get('recall',0):.3f} | "
-        f"buy  P={pc_t.get('buy',{}).get('precision',0):.3f}  R={pc_t.get('buy',{}).get('recall',0):.3f}"
+        f"sell P={pc_t['sell']['precision']:.3f} R={pc_t['sell']['recall']:.3f} | "
+        f"buy  P={pc_t['buy']['precision']:.3f}  R={pc_t['buy']['recall']:.3f}"
     )
 
     if wandb_run:

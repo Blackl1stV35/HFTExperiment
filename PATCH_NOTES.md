@@ -1,121 +1,80 @@
 # HFTExperiment — Patch Notes
 
-## Phase 3 — Regime-Informed Pipeline (current branch)
+## v2 — Architecture Improvements (current branch)
 
-### Overview
-Full integration of the market regime research (v5 notebook, 25 cells, 2005–2026)
-into the training and RL pipeline. The research phase is complete. All six pipeline
-steps are implemented in this branch.
+Based on review of 10 papers (see IMPROVEMENTS.md) and supervised/RL training
+results (see TRAINING_REPORT.md).
 
-### Research outputs consumed
-- `data/regime/daily_regime_labels.csv` — 7,344 daily rows, 35 columns
-  - `gmm2_state`         — 2-state GMM (Bear=0 / Bull=1), 5-day min-dwell smoothed
-  - `km_label_63d`       — KMeans cluster sorted by Sharpe, 63d-EMA smoothed
-  - `vol_regime`         — XAUUSD annualised vol (LOW/NORMAL/HIGH, thresholds 10.5/14.3%)
-  - `regime_quality_norm`— [0,1] Sharpe scalar from GMM×vol heatmap (obs[10])
-  - `gs_quartile_enc`    — G/S ratio quartile rank [0,1] (Q1=silver-leads, Q4=gold-leads)
-  - `cu_au_regime_enc`   — Copper-gold correlation regime (Financial/Mixed/Commodity)
-  - `dfii10_real_yield`  — FRED TIPS 10yr real yield
+### Priority 1 — Confidence calibrated against realised Sharpe (§5.1)
+**File:** `src/training/confidence_calibration.py` (new)
 
-### Key research findings driving each change
-| Finding | Change |
-|---------|--------|
-| GMM Bear Sharpe ≈ 0 (2-state Bear = −0.44) — Bear = "not Bull" | GMM2 Bull flag as sole entry gate (Step 6) |
-| G/S Q1 optimal hold = 7 days daily; Q4 = 80 days | G/S-conditioned max_hold: Q1→40, Q2/3→60, Q4→80 bars (Step 5) |
-| Bear+HIGH vol = Sharpe 0.33 (worst reliable cell) | regime_quality_norm scalar in obs (Step 4) |
-| Cu-Au 0.5 threshold confirmed optimal; Commodity regime Sharpe 0.63 | cu_au_regime_enc in obs (Step 4) |
-| 78% GMM Bear in 2026 / 0% Bull — training coverage gap | Regime-balanced sampler: Bear ×2.0, pre-2020 ×1.5, post-2024 ×0.5 (Step 3) |
-| Transition matrix: P(exit Bear today) = 0.7%, 50/50 crossover at ~42d | Deploy at reduced size until vol drops below 14.3% |
+The existing confidence head was trained as MSE(is_correct) against hold-dominated
+batches — by ep18 it output 0.974 with sell_recall=0.079 (confidently wrong).
+Activation variance is 96% uncorrelated with output importance (Variance≠Importance).
 
-### Files changed
+Changes:
+- `SharpeConfidenceHead`: regresses next-20-bar realised Sharpe from intermediate encoder layer (60-70% depth per §5.2)
+- `IsotonicCalibrator`: post-hoc isotonic regression on validation split
+- Integration point: `src/encoder/fusion.py` → tap intermediate layer for confidence
 
-#### New / replaced
+### Priority 2 — Transaction cost curriculum (§3.2)
+**File:** `scripts/train_rl.py` (rewritten)
+
+CCSO §3.2: anneal fees from 0 → real over N evolves. Different evolve-stage models
+behave qualitatively differently; deploy by volatility regime.
+
+v3 RL diagnosis (root cause): signal entry bonus/penalty (-1.0/+0.5) at 99 trades/ep
+dominated the reward signal, causing penalty-avoidance not PnL optimisation.
+Removed. Cost curriculum achieves the same goal at the correct reward scale.
+
+Changes:
+- `CostCurriculum` class: `commission: 0 → $0.70`, `spread: 0 → 2 pip` over N_EVOLVES stages
+- Checkpoint saved at each evolve boundary (`rl_agent_evolve{N}.pt`)
+- Deployment: route by volatility regime (Bear+HIGH → high evolve, conservative)
+- Signal entry bonus/penalty removed
+- `episode_len=8000` retained (99 trades/ep = 4× learning signal vs 2k)
+
+### Priority 3 — Encoder: CCSO two-stage architecture (§1.2, §1.3)
+**File:** `src/encoder/price_branch.py` (rewritten)
+
+CCSO: inter-sequence (cross-feature) Conv first, then intra-sequence (temporal)
+LocalAttention. Performance improves then degrades past w≈20 bars (their Fig 3).
+
+Changes:
+- `CrossFeatureConv`: Linear(F→2H) + GELU + Linear → mixes feature axis first
+- `LocalCausalAttention`: sliding causal mask w=20; O(n·w²) not O(n²)
+- Two-stage: stage1 → stage2 × n_layers
+
+### New files
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `src/encoder/price_branch_sessa.py` | Sessa mixer A/B vs CCSO branch | Stub — wired to LocalCausalAttention |
+| `src/meta_policy/lewm_world.py` | LeWM JEPA world model (GAN replacement) | SIGReg implemented; predictor MLP stub |
+| `src/meta_policy/regime_router.py` | Delay-line buffer + cross-attn router (HD-SNN §7) | Implemented |
+| `src/training/confidence_calibration.py` | Sharpe regression + isotonic calibration (§5.1) | Implemented |
+
+### Changes to existing files
+
 | File | Change |
 |------|--------|
-| `src/data/preprocessing.py` | Added `join_regime_labels()`, `get_regime_array()`, encoding maps |
-| `src/training/train_supervised.py` | Added `build_regime_balanced_sampler()`, regime-balanced DataLoader |
-| `scripts/train_rl.py` | Obs 10→13, G/S max_hold conditioning, GMM2 entry gate |
-| `configs/data/xauusd.yaml` | Added `class_weights: [2.5, 0.3, 2.5]`, confirmed `max_holding_bars: 80` |
-| `configs/rl/sac.yaml` | `obs_dim: 13`, Phase 3 regime section, G/S hold limits |
-| `notebooks/00_market_regime_explorer_v5.ipynb` | Final 25-cell research notebook |
+| `src/encoder/price_branch.py` | Full rewrite: CCSO two-stage |
+| `scripts/train_rl.py` | Full rewrite: cost curriculum, remove signal penalty |
+| `src/data/preprocessing.py` | Added `compute_rl_obs_features` (merged from feature_engineering) |
+| `src/training/train_supervised.py` | v4: FocalLoss, ReduceLROnPlateau, regime-stratified split, F1 criterion |
 
-#### Unchanged from Phase 2
-- `src/meta_policy/rl_agent.py` — ConfidenceSACAgent (obs_dim now passed as 13)
-- `src/data/feature_engineering.py` — compute_rl_obs_features()
-- `src/encoder/fusion.py` — DualBranchModel (frozen)
-- `src/backtesting/engine.py`
-- `src/hitl/mt5_interface.py`
-- `scripts/download_data.py`
-
-### Step-by-step execution (new branch)
-
-```bash
-# Step 1: Download 6666-day M1 XAUUSD (prerequisite for all ML work)
-python scripts/download_data.py --source mt5 --symbol XAUUSD --timeframe M1 --days 6666
-
-# Run research notebook to generate daily_regime_labels.csv
-# (or copy existing CSV from prior run)
-# jupyter notebook notebooks/00_market_regime_explorer_v5.ipynb
-
-# Step 2+3: Supervised training (regime-balanced sampler auto-activates if CSV present)
-python scripts/train_supervised.py model=dual_branch data=xauusd
-
-# Steps 4+5+6: RL training (obs=13, G/S hold, GMM2 gate)
-python scripts/train_rl.py \
-    --checkpoint models/dual_branch_best.pt \
-    --regime-csv data/regime/daily_regime_labels.csv \
-    --steps 500000 --seed 42 \
-    --mtm-scale 0.05 --hold-penalty 0.003 --early-cut-bonus 0.40 \
-    --curriculum-warmup 100000
-```
-
-### Observation vector (13-dim)
-```
-Index  Feature                 Source          Notes
-0      sell_prob               supervised      softmax[0]
-1      hold_prob               supervised      softmax[1]
-2      buy_prob                supervised      softmax[2]
-3      confidence              supervised      confidence head [0,1]
-4      position_dir            env             -1/0/1
-5      unrealized_pnl_norm     env             clipped [-5,5]
-6      hold_time_norm          env             hold/max_hold [0,1]
-7      atr_norm                feature_eng     rolling ATR/close [0,0.05]
-8      trend_norm              feature_eng     EMA slope clipped [-2,2]
-9      session_phase           feature_eng     London/NY [0,1]
-10     regime_quality_norm     regime_csv      GMM×vol heatmap Sharpe [0,1]  ← NEW
-11     gs_quartile_norm        regime_csv      G/S rank [0=silver-leads, 1=gold-leads] ← NEW
-12     cu_au_regime_enc        regime_csv      Cu-Au corr [0=Financial, 1=Commodity]   ← NEW
-```
-
-### Current macro context (as of 2026-04-17)
-- GMM2: **Bear** (P(exit today)=0.7%, 50/50 crossover at ~42 days forward)
-- KMeans 63d: **Regime-B** (Sharpe 0.66)
-- Vol regime: **HIGH** (19.9% ann — worst reliable cell with Bear = Sharpe 0.33)
-- G/S quartile: **Q1** (rank 0.15 — silver outperforming → max_hold=40 bars)
-- Cu-Au regime: **Commodity** (252d corr=0.52, Sharpe 0.63)
-- Business cycle: **Stagflation Q3** (growth z=−0.27, inflation z=+2.34)
-- DFII10: **+1.93%** — real yield framework broken post-2022 ($4,057 unexplained premium)
-- Deploy: reduced size until vol crosses below 14.3% HIGH threshold
+### Things NOT done (per §10 "don't do" list)
+- No SVD/rank-reduction compression — INT4 quantisation dominates 2–25× MSE
+- No multi-block linear approximation — distribution shift cascades through residuals
+- No PCA rotation of inputs — 20× worse MSE than direct INT4
+- No unbounded attention window growth — CCSO Fig 3 shows degradation past regime pattern length
 
 ---
 
-## Phase 2 — SAC v1–v4 (prior branch)
+## Phase 3 Regime-Informed Pipeline (prior)
 
-### v4 (final Phase 2)
-- RL obs 7→10: added atr_norm, trend_norm, session_phase
-- compute_rl_obs_features() in feature_engineering.py
-- Class weights [2.5, 0.3, 2.5] in xauusd.yaml
-- download_data.py: chunked MT5 (30d windows, 0.5s sleep) + yfinance fallback
-
-### v3
-- Curriculum EXIT_THRESHOLD 0.0→−0.10 at 100k steps
-- Removed pre-trade confidence gate from env (reward gate only)
-
-### v2
-- max_hold aligned to 80 bars (sweep-optimal)
-- MTM step reward (0.05×), quadratic hold penalty (0.003×)
-- Early-cut bonus (0.40×), dual-output actor [pos_size, exit_logit]
-
-### v1
-- Initial SAC agent with ConfidenceSACAgent
-- Triple barrier labels, 3-class supervised model
+See Phase 3 branch for:
+- join_regime_labels(), get_regime_array(), regime-stratified split
+- GMM2 Bear entry gate, G/S-conditioned max_hold
+- SequenceDataset OOM fix
+- 5 supervised runs, 3 RL runs
