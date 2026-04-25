@@ -216,18 +216,11 @@ def build_regime_balanced_sampler(
 
     if timestamps is not None and len(timestamps) == n:
         import pandas as pd
-        ts = pd.to_datetime(timestamps)
-        cutoff = pd.Timestamp("2020-01-01")
-
-        if isinstance(ts, (pd.Series, pd.Index)):
-            # pandas objects → safe to_numpy()
-            pre2020 = (ts < cutoff).to_numpy()
-        else:
-            # numpy datetime64 array → compare directly
-            ts = ts.astype("datetime64[ns]")
-            pre2020 = ts < np.datetime64(cutoff)
-
-        pre2020 = pre2020.astype(bool)
+        ts      = pd.to_datetime(timestamps)
+        cutoff  = pd.Timestamp("2020-01-01")
+        # np.asarray works on DatetimeIndex, Series, and numpy datetime64
+        # arrays without calling .to_numpy() on the boolean result.
+        pre2020 = np.asarray(ts < cutoff, dtype=bool)
         regime_mult[pre2020] *= 1.5
         logger.info(f"Temporal reweighting: pre-2020={pre2020.sum():,} x1.5")
 
@@ -295,15 +288,21 @@ class Trainer:
 
     @staticmethod
     def signal_score(per_class: dict) -> float:
+        """F1-based metric with sell precision floor >= 0.30.
+
+        Hard floor: sell precision < 0.30 returns 0.0 — checkpoint not saved.
+        At P=0.25 (prev best), RL breakeven WR ~51% — unreachable.
+        At P=0.30, breakeven WR ~49% — within reach.
+        Above floor: sell_F1*0.4 + buy_F1*0.4 as before.
+        """
         sp = per_class["sell"]["precision"]
         sr = per_class["sell"]["recall"]
-        # Hard floor: don't save unless sell precision >= 0.30
         if sp < 0.30:
             return 0.0
-        sell_f1 = 2 * sp * sr / (sp + sr) if (sp + sr) > 0 else 0.0
-        buy_p = per_class["buy"]["precision"]
-        buy_r = per_class["buy"]["recall"]
-        buy_f1 = 2 * buy_p * buy_r / (buy_p + buy_r) if (buy_p + buy_r) > 0 else 0.0
+        def f1(p, r):
+            return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        sell_f1 = f1(sp, sr)
+        buy_f1  = f1(per_class["buy"]["precision"], per_class["buy"]["recall"])
         return sell_f1 * 0.4 + buy_f1 * 0.4
 
     def load_checkpoint(self, path: str) -> None:
