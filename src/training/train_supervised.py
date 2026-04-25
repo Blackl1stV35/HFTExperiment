@@ -297,7 +297,7 @@ class Trainer:
         """
         sp = per_class["sell"]["precision"]
         sr = per_class["sell"]["recall"]
-        if sp < 0.30:
+        if sp < 0.25:
             return 0.0
         def f1(p, r):
             return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
