@@ -210,18 +210,4 @@ class PriceBranch(nn.Module):
         for i in range(tcn_layers):
             rf += 2 * (ks - 1) * (2 ** i)
         return rf
-"""Multi-scale CNN/TCN price branch with InceptionTime-style residual blocks.
 
-Processes OHLCV+spread tick data through parallel convolutions at multiple
-scales (3/5/7/11 bar kernels), capturing microstructure patterns, swing
-patterns, and trend structure simultaneously.
-
-Architecture:
-    Input (batch, seq, 6) → InceptionBlock × N → ResidualTCN → LayerNorm → output (batch, d_model)
-"""
-
-from __future__ import annotations
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
