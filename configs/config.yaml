@@ -10,7 +10,7 @@ project:
   device: auto
 
 training:
-  epochs: 60
+  epochs: 90
   batch_size: 2048
   learning_rate: 5e-5
   focal_gamma: 1.0 
