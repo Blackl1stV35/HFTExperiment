@@ -93,30 +93,59 @@ class LocalCausalAttention(nn.Module):
 class PriceBranch(nn.Module):
     """Two-stage price encoder: CrossFeatureConv → LocalCausalAttention.
 
-    Args:
-        in_features: OHLCV feature dim (default 6)
-        hidden_dim:  internal representation dim (default 128)
-        n_layers:    number of attention layers (default 2)
-        n_heads:     attention heads (default 4)
-        attn_window: local attention window in M1 bars (default 20)
-        dropout:     applied in both stages (default 0.1)
+    CCSO §1.2–1.3: Stage 1 mixes features (cross-feature Conv), Stage 2 mixes
+    time with a causal local-attention window.
+
+    Accepts both CCSO-style kwargs and the legacy fusion.py kwargs
+    (input_dim, inception_channels, tcn_layers, d_model, etc.) so that
+    DualBranchModel.from_config() works without modification.
+
+    Legacy → CCSO mapping:
+        input_dim          → in_features
+        d_model            → hidden_dim  (output dim passed to fusion)
+        n_inception_blocks → n_layers
+        tcn_layers         → n_layers  (max of the two)
+        inception_channels, tcn_kernel_size, kernel_sizes → ignored
     """
     def __init__(
         self,
-        in_features: int = 6,
-        hidden_dim:  int = 128,
-        n_layers:    int = 2,
-        n_heads:     int = 4,
-        attn_window: int = 20,
+        # CCSO-style args (preferred)
+        in_features: int   = 6,
+        hidden_dim:  int   = 128,
+        n_layers:    int   = 2,
+        n_heads:     int   = 4,
+        attn_window: int   = 20,
         dropout:     float = 0.1,
+        # Legacy fusion.py kwargs — mapped to CCSO equivalents
+        input_dim:          int   = None,
+        d_model:            int   = None,
+        inception_channels: int   = None,   # absorbed into hidden_dim
+        n_inception_blocks: int   = None,   # alias for n_layers
+        tcn_layers:         int   = None,   # alias for n_layers
+        tcn_kernel_size:    int   = None,   # ignored
+        kernel_sizes:       list  = None,   # ignored
+        price_dropout:      float = None,   # alias for dropout
+        **_kwargs,                          # absorb any remaining unknown args
     ):
         super().__init__()
+        # Apply legacy aliases — explicit CCSO args take precedence
+        if input_dim is not None and in_features == 6:
+            in_features = input_dim
+        if d_model is not None and hidden_dim == 128:
+            hidden_dim = d_model
+        if price_dropout is not None and dropout == 0.1:
+            dropout = price_dropout
+        if n_inception_blocks is not None:
+            n_layers = max(n_layers, n_inception_blocks)
+        if tcn_layers is not None:
+            n_layers = max(n_layers, tcn_layers)
+
         self.stage1 = CrossFeatureConv(in_features, hidden_dim, dropout)
         self.stage2 = nn.ModuleList([
             LocalCausalAttention(hidden_dim, n_heads, attn_window, dropout)
             for _ in range(n_layers)
         ])
-        self.pool = nn.AdaptiveAvgPool1d(1)   # global pooling → (B, D)
+        self.pool = nn.AdaptiveAvgPool1d(1)
         self.out_dim = hidden_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
