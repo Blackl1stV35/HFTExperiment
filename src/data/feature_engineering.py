@@ -1,9 +1,7 @@
-"""Feature engineering: TA indicators, microstructure, and RL observation features.
+"""Feature engineering: TA indicators and microstructure features.
 
-PATCH v4 additions:
-    compute_rl_obs_features() — adds atr_norm, trend_norm, session_phase arrays
-    that expand the RL observation space from 7 to 10 dimensions, giving the
-    SAC agent intra-bar market context it currently lacks.
+Note: compute_rl_obs_features() moved to src/data/preprocessing.py
+to consolidate all feature preparation into a single import.
 """
 
 from __future__ import annotations
@@ -13,64 +11,6 @@ import polars as pl
 from loguru import logger
 
 
-# ── RL observation feature computation ────────────────────────────────────────
-
-def compute_rl_obs_features(
-    prices: np.ndarray,
-    timestamps,            # list[datetime] or None
-    atr_period: int = 14,
-    ema_period: int = 20,
-    ema_lag: int = 5,
-    session_open_utc: float = 8.0,   # London open
-    session_range_hrs: float = 13.0, # 8–21 UTC covers London + NY overlap
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute 3 market-context features for the RL observation vector.
-
-    Returns:
-        atr_norm      (N,) float32 — rolling ATR / close, clipped [0, 0.05].
-                      Tells the agent current volatility regime.
-        trend_norm    (N,) float32 — EMA slope / close * 100, clipped [-2, 2].
-                      Tells the agent trend direction and magnitude.
-        session_phase (N,) float32 — [0, 1] London/NY overlap fraction.
-                      0 = outside session, 1 = peak overlap (12-16 UTC).
-
-    All three use only look-back information — no lookahead bias.
-    Pure NumPy for speed on large datasets (1M+ bars).
-    """
-    n = len(prices)
-    atr_norm      = np.zeros(n, dtype=np.float32)
-    trend_norm    = np.zeros(n, dtype=np.float32)
-    session_phase = np.zeros(n, dtype=np.float32)
-
-    # ── ATR proxy (rolling high-low range / close) ─────────────────────────
-    # True ATR needs H/L; we use a rolling price range as proxy since the
-    # feature vector only carries close prices at this stage.
-    for i in range(atr_period, n):
-        window = prices[i - atr_period : i + 1]
-        atr = (window.max() - window.min()) / max(prices[i], 1e-8)
-        atr_norm[i] = min(float(atr), 0.05)
-
-    # ── EMA slope (trend_norm) ─────────────────────────────────────────────
-    alpha = 2.0 / (ema_period + 1)
-    ema = np.zeros(n, dtype=np.float64)
-    ema[0] = prices[0]
-    for i in range(1, n):
-        ema[i] = alpha * prices[i] + (1 - alpha) * ema[i - 1]
-    for i in range(ema_lag, n):
-        slope = (ema[i] - ema[i - ema_lag]) / max(prices[i], 1e-8) * 100.0
-        trend_norm[i] = float(np.clip(slope, -2.0, 2.0))
-
-    # ── Session phase ──────────────────────────────────────────────────────
-    if timestamps is not None:
-        for i, ts in enumerate(timestamps):
-            try:
-                hour = ts.hour + ts.minute / 60.0
-                phase = (hour - session_open_utc) / session_range_hrs
-                session_phase[i] = float(np.clip(phase, 0.0, 1.0))
-            except Exception:
-                session_phase[i] = 0.5  # fallback: mid-session
-
-    return atr_norm, trend_norm, session_phase
 
 
 # ── TA indicator addition ──────────────────────────────────────────────────────
