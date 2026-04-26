@@ -1,4 +1,4 @@
-# XAUUSD M1 data configuration — Phase 3
+# XAUUSD M1 data configuration — Phase 3 v2 (ATR-adaptive labels)
 name: xauusd
 symbol: XAUUSD
 timeframe: M1
@@ -8,13 +8,23 @@ preprocessing:
   window_size: 120
 
 labeling:
-  method: hybrid
+  method: atr_adaptive          # was: hybrid — ATR-scaled barriers reduce label noise
+
+  # ATR-adaptive parameters (Path A fix)
+  # Targets scale with volatility: high-vol bars get wider barriers (fewer noisy labels)
+  atr_period: 14                # Wilder ATR smoothing period
+  atr_multiplier_tp: 1.5        # take-profit = 1.5 × ATR
+  atr_multiplier_sl: 0.75       # stop-loss   = 0.75 × ATR  (asymmetric: rewards larger)
+  atr_min_tp_pips: 150          # floor: never narrower than 150 pip TP
+  atr_max_tp_pips: 800          # ceiling: never wider than 800 pip TP
+
+  # Legacy fixed-target params (used by TripleBarrierLabeler/HybridLabeler if method changed back)
   profit_target_pips: 300
   stop_loss_pips: 150
-  max_holding_bars: 80          # aligned with sweep-optimal max_hold
+  max_holding_bars: 40          # tighter than before (was 80/120) — reduce hold contamination
   pip_value: 0.10
-  # Phase 3: explicit class weights [sell, hold, buy]
-  # Overrides auto-computed sqrt-dampened weights in the balanced sampler
+
+  # Class weights: buy raised to 5.0 (5× fewer labels than sell)
   class_weights: [2.5, 0.3, 5.0]
 
 sentiment:
