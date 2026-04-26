@@ -297,7 +297,7 @@ class Trainer:
         """
         sp = per_class["sell"]["precision"]
         sr = per_class["sell"]["recall"]
-        if sp < 0.25:
+        if sp < 0.30:
             return 0.0
         def f1(p, r):
             return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
@@ -469,6 +469,9 @@ def main(cfg: DictConfig) -> None:
         window_size   = cfg.data.preprocessing.window_size,
     )
     ws = cfg.data.preprocessing.window_size
+    # Extract raw high/low for ATR-adaptive labelling (before warmup trim)
+    high_prices = df_raw["high"].to_numpy() if "high" in df_raw.columns else None
+    low_prices  = df_raw["low"].to_numpy()  if "low"  in df_raw.columns else None
 
     gmm2_raw     = None
     vol_raw      = None
@@ -487,9 +490,17 @@ def main(cfg: DictConfig) -> None:
         max_holding_bars   = cfg.data.labeling.max_holding_bars,
         pip_value          = cfg.data.labeling.pip_value,
     )
-    labels   = get_labeler(label_cfg).label(close_prices)
-    features = features[ws:]
-    labels   = labels[ws:]
+    # Pass high/low to ATR labeller; other labellers accept but ignore them
+    from src.training.labels import ATRAdaptiveLabeler
+    _labeler = get_labeler(label_cfg)
+    if isinstance(_labeler, ATRAdaptiveLabeler):
+        labels = _labeler.label(close_prices, high_prices, low_prices)
+    else:
+        labels = _labeler.label(close_prices)
+    features    = features[ws:]
+    labels      = labels[ws:]
+    if high_prices is not None: high_prices = high_prices[ws:]
+    if low_prices  is not None: low_prices  = low_prices[ws:]
 
     sentiment = None
     if cfg.data.sentiment.enabled:
