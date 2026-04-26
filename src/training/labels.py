@@ -32,6 +32,12 @@ class LabelConfig:
     macd_fast: int = 12
     macd_slow: int = 26
     macd_signal: int = 9
+    # ATR-adaptive barrier parameters
+    atr_period: int = 14           # rolling ATR window
+    atr_multiplier_tp: float = 1.5 # take-profit = atr_multiplier_tp × ATR
+    atr_multiplier_sl: float = 0.75 # stop-loss = atr_multiplier_sl × ATR
+    atr_min_tp_pips: float = 150   # floor: never narrower than this
+    atr_max_tp_pips: float = 800   # ceiling: never wider than this
 
 
 class TripleBarrierLabeler:
@@ -183,6 +189,97 @@ class HybridLabeler:
         return labels
 
 
+
+class ATRAdaptiveLabeler:
+    """ATR-adaptive triple barrier labeling.
+
+    Path A fix: replace fixed pip targets with ATR-scaled targets.
+    High-volatility bars → wider barriers (fewer noisy labels).
+    Low-volatility bars  → tighter barriers (more signal, less drift).
+
+    Label assignment (same convention as TripleBarrierLabeler):
+        Upper barrier hit first → 2 (buy: price went up → long was right)
+        Lower barrier hit first → 0 (sell: price went down → short was right)
+        Time barrier (max_holding_bars) → 1 (hold)
+
+    Args:
+        cfg: LabelConfig with atr_period, atr_multiplier_tp, atr_multiplier_sl,
+             atr_min_tp_pips, atr_max_tp_pips, max_holding_bars, pip_value
+
+    Note: requires high and low price arrays in addition to close.
+    If high/low are None, falls back to close-based ATR proxy.
+    """
+
+    def __init__(self, cfg: LabelConfig):
+        self.atr_period     = cfg.atr_period
+        self.mult_tp        = cfg.atr_multiplier_tp
+        self.mult_sl        = cfg.atr_multiplier_sl
+        self.min_tp         = cfg.atr_min_tp_pips * cfg.pip_value
+        self.max_tp         = cfg.atr_max_tp_pips * cfg.pip_value
+        self.max_holding    = cfg.max_holding_bars
+
+    def _compute_atr(
+        self,
+        close: np.ndarray,
+        high:  np.ndarray | None,
+        low:   np.ndarray | None,
+    ) -> np.ndarray:
+        """Rolling ATR. Falls back to close-range proxy if high/low absent."""
+        n = len(close)
+        if high is not None and low is not None:
+            tr = np.maximum(
+                high - low,
+                np.maximum(
+                    np.abs(high - np.roll(close, 1)),
+                    np.abs(low  - np.roll(close, 1)),
+                )
+            )
+            tr[0] = high[0] - low[0]
+        else:
+            # Proxy: rolling high-low of close prices
+            tr = np.abs(np.diff(close, prepend=close[0]))
+
+        # Wilder smoothing (EMA with alpha=1/period)
+        atr = np.zeros(n, dtype=np.float32)
+        atr[:self.atr_period] = tr[:self.atr_period].mean()
+        alpha = 1.0 / self.atr_period
+        for i in range(self.atr_period, n):
+            atr[i] = alpha * tr[i] + (1 - alpha) * atr[i - 1]
+        return atr
+
+    def label(
+        self,
+        close: np.ndarray,
+        high:  np.ndarray | None = None,
+        low:   np.ndarray | None = None,
+    ) -> np.ndarray:
+        atr    = self._compute_atr(close, high, low)
+        n      = len(close)
+        labels = np.ones(n, dtype=np.int64)
+
+        for i in range(n - 1):
+            bar_atr = float(atr[i])
+            tp = float(np.clip(
+                self.mult_tp * bar_atr, self.min_tp, self.max_tp
+            ))
+            sl = float(np.clip(
+                self.mult_sl * bar_atr, self.min_tp * 0.5, self.max_tp * 0.5
+            ))
+
+            entry = close[i]
+            max_j = min(i + self.max_holding, n)
+            for j in range(i + 1, max_j):
+                change = close[j] - entry
+                if change >= tp:
+                    labels[i] = 2   # buy
+                    break
+                elif change <= -sl:
+                    labels[i] = 0   # sell
+                    break
+
+        return labels
+
+
 def get_labeler(cfg: LabelConfig):
     """Factory for labelers."""
     if cfg.method == "triple_barrier":
@@ -191,6 +288,8 @@ def get_labeler(cfg: LabelConfig):
         return MACDRSILabeler(cfg)
     elif cfg.method == "hybrid":
         return HybridLabeler(cfg)
+    elif cfg.method == "atr_adaptive":
+        return ATRAdaptiveLabeler(cfg)
     else:
         raise ValueError(f"Unknown labeling method: {cfg.method}")
 
