@@ -91,12 +91,16 @@ def prepare_features(
     df: pl.DataFrame,
     scaler_method: str = "window_minmax",
     window_size: int = 120,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Extract and scale OHLCV+spread features from a Polars M1 DataFrame.
 
     Returns:
         features:     (N, 6) float32  — scaled [open, high, low, close, tick_vol, spread]
         close_prices: (N,)   float64  — raw close prices for labelling
+        high_prices:  (N,)   float64  — raw high prices  (ATR labelling)
+        low_prices:   (N,)   float64  — raw low prices   (ATR labelling)
+
+    All four arrays are aligned to the same weekday-filtered, forward-filled rows.
     """
     df = df.filter(pl.col("timestamp").dt.weekday().is_in([1, 2, 3, 4, 5]))
     for c in ["open", "high", "low", "close"]:
@@ -105,11 +109,13 @@ def prepare_features(
     feature_cols = ["open", "high", "low", "close", "tick_volume", "spread"]
     features     = df.select(feature_cols).to_numpy().astype(np.float32)
     close_prices = df["close"].to_numpy()
+    high_prices  = df["high"].to_numpy()
+    low_prices   = df["low"].to_numpy()
 
     scaler  = get_scaler(scaler_method, window_size)
     scaled  = scaler.transform(features).astype(np.float32)
     logger.info(f"Features prepared: {scaled.shape}")
-    return scaled, close_prices
+    return scaled, close_prices, high_prices, low_prices
 
 
 # ── Regime label joining (Step 2) ─────────────────────────────────────────────

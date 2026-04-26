@@ -463,15 +463,12 @@ def main(cfg: DictConfig) -> None:
     df_raw     = join_regime_labels(df_raw, regime_csv)
     timestamps = df_raw["timestamp"].to_list() if "timestamp" in df_raw.columns else None
 
-    features, close_prices = prepare_features(
+    features, close_prices, high_prices, low_prices = prepare_features(
         df_raw,
         scaler_method = cfg.data.preprocessing.scaling,
         window_size   = cfg.data.preprocessing.window_size,
     )
     ws = cfg.data.preprocessing.window_size
-    # Extract raw high/low for ATR-adaptive labelling (before warmup trim)
-    high_prices = df_raw["high"].to_numpy() if "high" in df_raw.columns else None
-    low_prices  = df_raw["low"].to_numpy()  if "low"  in df_raw.columns else None
 
     gmm2_raw     = None
     vol_raw      = None

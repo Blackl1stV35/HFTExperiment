@@ -398,7 +398,7 @@ def main():
 
     df = join_regime_labels(df, args.regime_csv)
     regime_arr_full = get_regime_array(df)
-    features, close_prices = prepare_features(df, window_size=args.window_size)
+    features, close_prices, _, _ = prepare_features(df, window_size=args.window_size)
     ws = args.window_size
     features = features[ws:]; close_prices = close_prices[ws:]; regime_arr = regime_arr_full[ws:]
 
