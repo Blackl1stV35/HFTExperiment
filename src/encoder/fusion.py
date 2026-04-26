@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.encoder.price_branch import PriceBranch
+from src.encoder.price_branch_ccso import PriceBranch
 from src.encoder.sentiment_branch import SentimentBranch
 
 
