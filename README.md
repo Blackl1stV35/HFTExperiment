@@ -1,9 +1,9 @@
-## Under-development 
+## Underdevelopment 
 
-## Project Structure
+## Project Structure (not finalised)
 
 ```
-xauusd-v2/
+HFTExperiment/
 ├── configs/              # Hydra configuration
 ├── src/
 │   ├── encoder/          # Dual-branch encoder architecture
@@ -31,3 +31,6 @@ xauusd-v2/
 ├── tests/                # Tests
 └── rust_inference/       # Optional Rust inference engine
 ```
+
+## License
+This code is proprietary and confidential. Unauthorized copying, distribution, or use of this file, via any medium, is strictly prohibited
