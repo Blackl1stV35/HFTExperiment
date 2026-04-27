@@ -10,12 +10,12 @@ project:
   device: auto
 
 training:
-  epochs: 60
+  epochs: 90
   batch_size: 2048
   learning_rate: 5e-5
   focal_gamma: 1.0 
   weight_decay: 1e-5
-  early_stopping_patience: 15
+  early_stopping_patience: 30
   gradient_clip: 10.0
   mixed_precision: false
   num_workers: 0

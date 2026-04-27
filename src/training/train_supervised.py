@@ -271,7 +271,7 @@ class Trainer:
             self.optimizer,
             mode     = "max",      # maximise signal_score
             factor   = 0.5,
-            patience = 5,
+            patience = 15,
             min_lr   = 1e-6,
         )
 
@@ -297,7 +297,7 @@ class Trainer:
         """
         sp = per_class["sell"]["precision"]
         sr = per_class["sell"]["recall"]
-        if sp < 0.30:
+        if sp < 0.01:
             return 0.0
         def f1(p, r):
             return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
