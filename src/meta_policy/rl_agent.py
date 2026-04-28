@@ -63,8 +63,8 @@ class ConfidenceSACAgent:
         gamma: float = 0.99,
         tau: float = 0.005,
         lr: float = 3e-4,
-        buffer_capacity: int = 500_000,
-        batch_size: int = 256,
+        buffer_capacity: int = 500_000,  # overridable for A100
+        batch_size: int = 256,  # overridable for A100
         device: str = "cpu",
         curriculum_warmup_steps: int = 100_000,
     ):
