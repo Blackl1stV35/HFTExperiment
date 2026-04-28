@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.encoder.price_branch import PriceBranch
+from src.encoder.price_branch_scatter_tcn import PriceBranch  # Candidate B
 from src.encoder.sentiment_branch import SentimentBranch
 
 
@@ -100,15 +100,20 @@ class DualBranchModel(nn.Module):
 
     def __init__(
         self,
-        # Price branch
-        input_dim: int = 6,
+        # Price branch — accepts both ScatterTCN and legacy InceptionBlock params
+        input_dim: int = 10,            # 10-dim for Phase 4
         inception_channels: int = 128,
         n_inception_blocks: int = 2,
         kernel_sizes: list[int] = [3, 5, 7, 11],
         tcn_layers: int = 4,
         tcn_kernel_size: int = 3,
-        price_dropout: float = 0.2,
+        price_dropout: float = 0.1,
         d_model: int = 192,
+        # ScatterTCN-specific (ignored by old PriceBranch via **_kwargs)
+        scatter_J: int = 3,
+        scatter_Q: int = 4,
+        filter_len: int = 31,
+        attn_window: int = 20,
         # Sentiment branch
         sentiment_input_dim: int = 768,
         sentiment_hidden_dim: int = 256,
@@ -123,16 +128,21 @@ class DualBranchModel(nn.Module):
     ):
         super().__init__()
 
-        # Price branch: multi-scale CNN/TCN
+        # Price branch: ScatterTCN (Candidate B) or InceptionBlock via **_kwargs
         self.price_branch = PriceBranch(
             input_dim=input_dim,
+            d_model=d_model,
+            scatter_J=scatter_J,
+            scatter_Q=scatter_Q,
+            filter_len=filter_len,
+            tcn_layers=tcn_layers,
+            attn_window=attn_window,
+            dropout=price_dropout,
+            # Legacy forwarded (absorbed if not used)
             inception_channels=inception_channels,
             n_inception_blocks=n_inception_blocks,
             kernel_sizes=kernel_sizes,
-            tcn_layers=tcn_layers,
             tcn_kernel_size=tcn_kernel_size,
-            dropout=price_dropout,
-            d_model=d_model,
         )
 
         # Sentiment branch: FinBERT → MLP
@@ -247,15 +257,23 @@ class DualBranchModel(nn.Module):
 
     @classmethod
     def from_config(cls, cfg) -> "DualBranchModel":
-        """Build from Hydra config."""
+        """Build from Hydra config. Passes all price params; ScatterTCN branch
+        accepts legacy inception/tcn keys and maps them via **_kwargs."""
+        price_cfg = cfg.price
         return cls(
             input_dim=cfg.input.feature_dim,
-            inception_channels=cfg.price.inception_channels,
-            n_inception_blocks=cfg.price.n_inception_blocks,
-            kernel_sizes=cfg.price.kernel_sizes,
-            tcn_layers=cfg.price.tcn_layers,
-            tcn_kernel_size=cfg.price.tcn_kernel_size,
-            price_dropout=cfg.price.dropout,
+            # ScatterTCN-specific params (passed if present, ignored otherwise)
+            scatter_J   =getattr(price_cfg, "scatter_J",    3),
+            scatter_Q   =getattr(price_cfg, "scatter_Q",    4),
+            filter_len  =getattr(price_cfg, "filter_len",   31),
+            tcn_layers  =getattr(price_cfg, "tcn_layers",   4),
+            attn_window =getattr(price_cfg, "attn_window",  20),
+            # Legacy keys forwarded (absorbed by **_kwargs if not used)
+            inception_channels=getattr(price_cfg, "inception_channels", 128),
+            n_inception_blocks=getattr(price_cfg, "n_inception_blocks", 2),
+            kernel_sizes=getattr(price_cfg, "kernel_sizes", [3,5,7,11]),
+            tcn_kernel_size=getattr(price_cfg, "tcn_kernel_size", 3),
+            price_dropout=price_cfg.dropout,
             d_model=cfg.d_model,
             sentiment_input_dim=cfg.sentiment.input_dim,
             sentiment_hidden_dim=cfg.sentiment.hidden_dim,
