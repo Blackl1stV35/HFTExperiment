@@ -621,13 +621,11 @@ def main(cfg: DictConfig) -> None:
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model: {n_params:,} params")
 
-    # A100: torch.compile gives 10-30% throughput gain on PyTorch ≥ 2.0
-    if hasattr(torch, "compile") and device.type == "cuda":
-        try:
-            model = torch.compile(model, mode="default")  # reduce-overhead enables cudagraphs which breaks sdpa
-            logger.info("torch.compile enabled (mode=reduce-overhead)")
-        except Exception as e:
-            logger.warning(f"torch.compile failed — running eager: {e}")
+    # torch.compile disabled: ScatterTCNPriceBranch uses as_strided with
+    # dynamic chunk sizes — TorchInductor cannot statically trace these shapes
+    # and produces a stale cached kernel that crashes on the first val epoch.
+    # bf16 + batch=4096 on A100 already saturates SM utilisation without compile.
+    logger.info("torch.compile skipped (dynamic shapes in ScatterTCN)")
 
     trainer = Trainer(cfg, model, device, class_weights=class_weights_arr)
 

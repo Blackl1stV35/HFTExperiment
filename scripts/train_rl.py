@@ -420,14 +420,7 @@ def main():
     model.to(device).eval()
     for p in model.parameters(): p.requires_grad = False
     _np = sum(p.numel() for p in model.parameters())
-    if hasattr(torch, "compile") and device.type == "cuda":
-        try:
-            model = torch.compile(model, mode="default")  # reduce-overhead cudagraphs breaks sdpa
-            logger.info(f"Frozen model compiled: {_np:,} params")
-        except Exception as e:
-            logger.warning(f"torch.compile skipped: {e}")
-    else:
-        logger.info(f"Frozen model: {_np:,} params")
+    logger.info(f"Frozen model: {_np:,} params")  # torch.compile skipped
 
     signals, confidences = extract_model_features(model, features, sl, device, args.batch_size)
 
