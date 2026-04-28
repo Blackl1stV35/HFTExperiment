@@ -6,7 +6,7 @@ agent:
   tau: 0.005
   lr: 3.0e-4
   buffer_capacity: 2_000_000  # A100 CPU RAM: 128 GB — 4× buffer
-  batch_size: 4096            # A100: was 256 — larger SAC batches
+  batch_size: 2048            # A100: was 256 — larger SAC batches
 
 training:
   steps: 1_500_000

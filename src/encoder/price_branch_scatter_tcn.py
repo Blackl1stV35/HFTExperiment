@@ -241,13 +241,17 @@ class LocalCausalAttention(nn.Module):
         Q = self.q(x).view(B, T, self.n_heads, self.d_k).transpose(1, 2)  # (B,H,T,dk)
         K = self.k(x).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
         V = self.v(x).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
-        # F.scaled_dot_product_attention: fused kernel, avoids materialising (T,T)
-        # is_causal=True applies a causal mask internally
+        # Build explicit causal mask — avoids the is_causal=True path that
+        # crashes in compiled+cudagraph context on short sequences (T=20).
+        # At T=20 the mask is tiny (20×20 = 400 elements) — no memory concern.
+        causal_mask = torch.triu(
+            torch.full((T, T), float('-inf'), device=Q.device, dtype=Q.dtype), diagonal=1
+        )
         out = F.scaled_dot_product_attention(
             Q, K, V,
-            attn_mask  = None,
-            dropout_p  = self.drop_p if self.training else 0.0,
-            is_causal  = True,
+            attn_mask = causal_mask,
+            dropout_p = self.drop_p if self.training else 0.0,
+            is_causal  = False,   # mask supplied explicitly
         )                                                      # (B,H,T,dk)
         out = out.transpose(1, 2).contiguous().view(B, T, D)  # (B,T,D)
         return residual + self.out(out)

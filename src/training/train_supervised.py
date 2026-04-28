@@ -290,7 +290,7 @@ class Trainer:
         self.use_amp = bool(cfg.training.get("mixed_precision", False))
         amp_dtype    = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         self.amp_dtype  = amp_dtype
-        self.scaler     = torch.cuda.amp.GradScaler(enabled=self.use_amp and amp_dtype == torch.float16)
+        self.scaler     = torch.amp.GradScaler('cuda', enabled=self.use_amp and amp_dtype == torch.float16)
         # bf16 doesn't need a loss scaler — only fp16 does
 
     @staticmethod
@@ -362,7 +362,7 @@ class Trainer:
             X, S, y = self._unpack_batch(batch)
             self.optimizer.zero_grad(set_to_none=True)   # A100: faster than zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
                 logits, confidence = self.model(X, S)
                 signal_loss = self.criterion(logits, y)
                 with torch.no_grad():
@@ -452,6 +452,8 @@ def main(cfg: DictConfig) -> None:
     set_seed(cfg.project.seed)
     device = get_device(cfg.project.device)
     logger.info(f"Device: {device}")
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")  # TF32 on A100 — free 20% speedup
 
     wandb_run = None
     try:
@@ -622,7 +624,7 @@ def main(cfg: DictConfig) -> None:
     # A100: torch.compile gives 10-30% throughput gain on PyTorch ≥ 2.0
     if hasattr(torch, "compile") and device.type == "cuda":
         try:
-            model = torch.compile(model, mode="reduce-overhead")
+            model = torch.compile(model, mode="default")  # reduce-overhead enables cudagraphs which breaks sdpa
             logger.info("torch.compile enabled (mode=reduce-overhead)")
         except Exception as e:
             logger.warning(f"torch.compile failed — running eager: {e}")

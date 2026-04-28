@@ -390,6 +390,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") \
              if args.device == "auto" else torch.device(args.device)
     logger.info(f"Device: {device}")
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")  # TF32 on A100
 
     ckpt_path = Path(args.checkpoint)
     if not ckpt_path.exists():
@@ -420,7 +422,7 @@ def main():
     _np = sum(p.numel() for p in model.parameters())
     if hasattr(torch, "compile") and device.type == "cuda":
         try:
-            model = torch.compile(model, mode="reduce-overhead")
+            model = torch.compile(model, mode="default")  # reduce-overhead cudagraphs breaks sdpa
             logger.info(f"Frozen model compiled: {_np:,} params")
         except Exception as e:
             logger.warning(f"torch.compile skipped: {e}")

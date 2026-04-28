@@ -11,14 +11,14 @@ project:
 
 training:
   epochs: 90
-  batch_size: 8192          # A100 80 GB — 4× T4's 2048
+  batch_size: 4096          # A100 80 GB — 4× T4's 2048
   learning_rate: 5e-5
   weight_decay: 1e-5
   early_stopping_patience: 30
   gradient_clip: 10.0
   focal_gamma: 1.0
   mixed_precision: true     # bf16 on A100 — free ~20% throughput
-  num_workers: 10           # A100 instances have 12+ CPU cores
+  num_workers: 8           # A100 instances have 12+ CPU cores
   val_split: 0.15
   test_split: 0.10
   pin_memory: true          # PCIe pinned transfer to A100 HBM2e
