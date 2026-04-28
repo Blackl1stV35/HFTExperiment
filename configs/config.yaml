@@ -18,7 +18,7 @@ training:
   gradient_clip: 10.0
   focal_gamma: 1.0
   mixed_precision: true     # bf16 on A100 — free ~20% throughput
-  num_workers: 12            # A100 instances have 12+ CPU cores
+  num_workers: 10           # A100 instances have 12+ CPU cores
   val_split: 0.15
   test_split: 0.10
   pin_memory: true          # PCIe pinned transfer to A100 HBM2e
