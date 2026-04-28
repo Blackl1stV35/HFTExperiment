@@ -204,7 +204,19 @@ class CausalTCNBlock(nn.Module):
 # ── Local Causal Attention ────────────────────────────────────────────────────
 
 class LocalCausalAttention(nn.Module):
-    """Causal local attention, window=20. For short-horizon stream."""
+    """Memory-efficient causal attention for the short-horizon stream.
+
+    OOM fix: the full (B, H, T, T) score matrix at T=240, B=2048 requires
+    ~1.9 GB. Instead:
+      1. Only run attention on the last `window` bars (the short stream is
+         sliced to T=window before being passed here — see ScatterTCNPriceBranch).
+      2. Use F.scaled_dot_product_attention with an is_causal mask, which
+         fuses QKV into a single memory-efficient kernel (FlashAttention when
+         available, otherwise chunked — both avoid materialising the full (T,T)
+         matrix).
+
+    At T=window=20, B=2048, H=4: score matrix = 2048*4*20*20*4B = 13 MB — safe.
+    """
 
     def __init__(self, d_model: int, n_heads: int = 4, window: int = 20,
                  dropout: float = 0.1):
@@ -218,24 +230,26 @@ class LocalCausalAttention(nn.Module):
         self.k   = nn.Linear(d_model, d_model, bias=False)
         self.v   = nn.Linear(d_model, d_model, bias=False)
         self.out = nn.Linear(d_model, d_model)
-        self.drop = nn.Dropout(dropout)
+        self.drop_p  = dropout
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x should already be (B, window, D) — sliced by caller
         B, T, D = x.shape
         residual = x
         x = self.norm(x)
-        Q = self.q(x).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
+        Q = self.q(x).view(B, T, self.n_heads, self.d_k).transpose(1, 2)  # (B,H,T,dk)
         K = self.k(x).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
         V = self.v(x).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        mask = torch.full((T, T), float('-inf'), device=x.device, dtype=x.dtype)
-        for i in range(T):
-            lo = max(0, i - self.window + 1)
-            mask[i, lo:i + 1] = 0.0
-        scores = scores + mask.unsqueeze(0).unsqueeze(0)
-        attn = self.drop(torch.softmax(scores, dim=-1))
-        out  = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, T, D)
+        # F.scaled_dot_product_attention: fused kernel, avoids materialising (T,T)
+        # is_causal=True applies a causal mask internally
+        out = F.scaled_dot_product_attention(
+            Q, K, V,
+            attn_mask  = None,
+            dropout_p  = self.drop_p if self.training else 0.0,
+            is_causal  = True,
+        )                                                      # (B,H,T,dk)
+        out = out.transpose(1, 2).contiguous().view(B, T, D)  # (B,T,D)
         return residual + self.out(out)
 
 
@@ -353,8 +367,9 @@ class ScatterTCNPriceBranch(nn.Module):
             nn.Dropout(dropout),
         )
 
-        self.d_model  = d_model
-        self.out_dim  = d_model
+        self.d_model     = d_model
+        self.out_dim     = d_model
+        self.attn_window = attn_window  # stored for forward slice
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -380,17 +395,18 @@ class ScatterTCNPriceBranch(nn.Module):
         long_weights = torch.softmax(long_scores, dim=-1)
         long_pooled  = (tcn_out * long_weights.unsqueeze(-1)).sum(1)
 
-        # ── Short-horizon branch ──────────────────────────────────────────────
-        x_short = x[:, :, self._SHORT_IDX]          # (B, T, 3)
-        h_short = self.short_proj(x_short)           # (B, T, d_model)
+        # ── Short-horizon branch (last `attn_window` bars only) ─────────────
+        # Slice BEFORE attention: avoids building (B,H,T=240,T=240) score matrix.
+        # Signal is concentrated in last 20 bars (wick_asymmetry, vol_zscore).
+        x_short  = x[:, -self.attn_window:, :][:, :, self._SHORT_IDX]  # (B,w,3)
+        h_short  = self.short_proj(x_short)           # (B, w, d_model)
         for layer in self.attn_layers:
-            h_short = layer(h_short)                 # (B, T, d_model)
+            h_short = layer(h_short)                  # (B, w, d_model)  T=w=20
 
-        # Pool over last 20 bars only (where signal is concentrated)
-        h_last20 = h_short[:, -20:, :]              # (B, 20, d_model)
-        short_scores  = self.short_pool(h_last20).squeeze(-1)
+        # Pool over the window
+        short_scores  = self.short_pool(h_short).squeeze(-1)
         short_weights = torch.softmax(short_scores, dim=-1)
-        short_pooled  = (h_last20 * short_weights.unsqueeze(-1)).sum(1)
+        short_pooled  = (h_short * short_weights.unsqueeze(-1)).sum(1)
 
         # ── Fusion ────────────────────────────────────────────────────────────
         combined = torch.cat([long_pooled, short_pooled], dim=-1)  # (B, d_model*2)
