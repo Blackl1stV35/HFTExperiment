@@ -112,10 +112,47 @@ def prepare_features(
     high_prices  = df["high"].to_numpy()
     low_prices   = df["low"].to_numpy()
 
+    # ── 4 microstructure features (Phase 4, Candidate B) ─────────────────────
+    # Evidence: 240-bar sequence profiling shows all 4 features have KS > 0.10
+    # and MI significantly above OHLCV baseline.
+    c = close_prices
+    h = high_prices
+    l = low_prices
+    vol  = features[:, 4].astype(np.float64)
+    sprd = features[:, 5].astype(np.float64)  # unscaled spread
+
+    # Use raw spread from df for spread_pressure
+    sprd_raw = df["spread"].to_numpy().astype(np.float64)
+
+    # 1. bar_return_bps — scale-invariant direction+magnitude (KS=0.162, MI=0.015)
+    bar_return = np.empty(len(c), dtype=np.float32)
+    bar_return[0] = 0.0
+    bar_return[1:] = ((c[1:] - c[:-1]) / (c[:-1] + 1e-8) * 10000).astype(np.float32)
+
+    # 2. wick_asymmetry — (upper-lower)/range, concentrated last-20 (KS=0.252, MI=0.037)
+    bar_range = (h - l).astype(np.float32)
+    upper_wick = ((h - c) / (bar_range + 1e-8)).astype(np.float32)
+    lower_wick = ((c - l) / (bar_range + 1e-8)).astype(np.float32)
+    wick_asymmetry = upper_wick - lower_wick  # positive = bearish pressure
+
+    # 3. vol_zscore — volume anomaly, tanh-smooth (KS=0.111, MI=0.024)
+    vol_s = pl.Series(vol)
+    vol_mean = np.array(vol_s.rolling_mean(20).fill_null(vol[:20].mean()), dtype=np.float64)
+    vol_std  = np.array(vol_s.rolling_std(20).fill_null(1.0), dtype=np.float64)
+    vol_zscore = np.tanh(((vol - vol_mean) / (vol_std + 1e-8)) / 2).astype(np.float32)
+
+    # 4. spread_pressure — log1p(spread/range), smooth tail (KS=0.600, MI=0.056)
+    spread_pressure = np.log1p(sprd_raw / (bar_range.astype(np.float64) + 1e-8)).astype(np.float32)
+
+    micro_4d = np.stack([bar_return, wick_asymmetry, vol_zscore, spread_pressure], axis=1)
+
+    # Scale OHLCV block, leave micro block pre-normalised (RobustScaler equivalent)
     scaler  = get_scaler(scaler_method, window_size)
-    scaled  = scaler.transform(features).astype(np.float32)
-    logger.info(f"Features prepared: {scaled.shape}")
-    return scaled, close_prices, high_prices, low_prices
+    scaled_6d  = scaler.transform(features).astype(np.float32)
+    scaled_10d = np.concatenate([scaled_6d, micro_4d], axis=1)  # (N, 10)
+
+    logger.info(f"Features prepared: {scaled_10d.shape}  (6-dim OHLCV + 4-dim micro)")
+    return scaled_10d, close_prices, high_prices, low_prices
 
 
 # ── Regime label joining (Step 2) ─────────────────────────────────────────────
