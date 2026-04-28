@@ -321,7 +321,10 @@ class FrozenEncoderEnv(gym.Env):
 
 def extract_model_features(model, features, seq_len, device, batch_size=2048):
     ds = SequenceDataset(features, seq_len)
-    loader = DataLoader(ds, batch_size=batch_size, num_workers=0, pin_memory=False, shuffle=False)
+    n_cpu  = min(8, __import__("os").cpu_count() or 1)
+    loader = DataLoader(ds, batch_size=batch_size, num_workers=n_cpu,
+                        pin_memory=True, shuffle=False, persistent_workers=True,
+                        prefetch_factor=4)
     all_probs, all_confs = [], []
     model.eval()
     logger.info(f"Extracting signals across {len(loader)} batches...")
@@ -379,7 +382,7 @@ def main():
     parser.add_argument("--hold-penalty",     type=float,default=0.003)
     parser.add_argument("--early-cut-bonus",  type=float,default=0.40)
     parser.add_argument("--curriculum-warmup",type=int,  default=100_000)
-    parser.add_argument("--batch-size",       type=int,  default=2048)
+    parser.add_argument("--batch-size",       type=int,  default=8192)  # A100
     parser.add_argument("--regime-csv",       default="data/regime/daily_regime_labels.csv")
     args = parser.parse_args()
 
@@ -414,6 +417,15 @@ def main():
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device).eval()
     for p in model.parameters(): p.requires_grad = False
+    _np = sum(p.numel() for p in model.parameters())
+    if hasattr(torch, "compile") and device.type == "cuda":
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            logger.info(f"Frozen model compiled: {_np:,} params")
+        except Exception as e:
+            logger.warning(f"torch.compile skipped: {e}")
+    else:
+        logger.info(f"Frozen model: {_np:,} params")
 
     signals, confidences = extract_model_features(model, features, sl, device, args.batch_size)
 
@@ -449,8 +461,11 @@ def main():
     train_env = make_env(0, split)
     eval_env  = make_env(split, len(signals), args.commission, args.spread_pips)
 
-    agent = ConfidenceSACAgent(obs_dim=13, hidden_dims=[256,256],
-                               device=str(device), curriculum_warmup_steps=args.curriculum_warmup)
+    agent = ConfidenceSACAgent(
+        obs_dim=13, hidden_dims=[512, 512],
+        device=str(device), curriculum_warmup_steps=args.curriculum_warmup,
+        buffer_capacity=2_000_000, batch_size=2048,
+    )
     logger.info(
         f"Phase 3 RL v2: cost curriculum n_evolves={args.n_evolves}\n"
         f"  commission: 0 → ${args.commission} over {args.steps:,} steps\n"
