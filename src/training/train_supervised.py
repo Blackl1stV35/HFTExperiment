@@ -271,7 +271,7 @@ class Trainer:
             self.optimizer,
             mode     = "max",      # maximise signal_score
             factor   = 0.5,
-            patience = 15,
+            patience = 5,
             min_lr   = 1e-6,
         )
 
@@ -286,6 +286,13 @@ class Trainer:
         self.patience_counter  = 0
         self.start_epoch       = 1
 
+        # A100: bf16 mixed precision (better than fp16 — no inf/nan risk)
+        self.use_amp = bool(cfg.training.get("mixed_precision", False))
+        amp_dtype    = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        self.amp_dtype  = amp_dtype
+        self.scaler     = torch.cuda.amp.GradScaler(enabled=self.use_amp and amp_dtype == torch.float16)
+        # bf16 doesn't need a loss scaler — only fp16 does
+
     @staticmethod
     def signal_score(per_class: dict) -> float:
         """F1-based metric with sell precision floor >= 0.30.
@@ -297,7 +304,7 @@ class Trainer:
         """
         sp = per_class["sell"]["precision"]
         sr = per_class["sell"]["recall"]
-        if sp < 0.01:
+        if sp < 0.30:
             return 0.0
         def f1(p, r):
             return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
@@ -353,16 +360,23 @@ class Trainer:
 
         for batch in loader:
             X, S, y = self._unpack_batch(batch)
-            self.optimizer.zero_grad()
-            logits, confidence = self.model(X, S)
-            signal_loss = self.criterion(logits, y)
-            with torch.no_grad():
-                is_correct = (logits.argmax(dim=-1) == y).float().unsqueeze(-1)
-            conf_loss = self.confidence_criterion(confidence, is_correct)
-            loss = signal_loss + 0.5 * conf_loss
-            loss.backward()
+            self.optimizer.zero_grad(set_to_none=True)   # A100: faster than zero_grad()
+
+            with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                logits, confidence = self.model(X, S)
+                signal_loss = self.criterion(logits, y)
+                with torch.no_grad():
+                    is_correct = (logits.argmax(dim=-1) == y).float().unsqueeze(-1)
+                conf_loss = self.confidence_criterion(confidence, is_correct)
+                loss = signal_loss + 0.5 * conf_loss
+
+            # GradScaler: no-op for bf16 (enabled=False), active for fp16
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.training.gradient_clip)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
             total_loss += signal_loss.item() * X.size(0)
             correct    += (logits.argmax(dim=-1) == y).sum().item()
             total      += X.size(0)
@@ -557,7 +571,10 @@ def main(cfg: DictConfig) -> None:
 
     # ── Regime-balanced sampler ───────────────────────────────────────────────
     cw_cfg     = list(cfg.data.labeling.get("class_weights", [])) or None
-    epoch_size = min(500_000, len(train_idx))
+    # A100: raise epoch_size — 500k was a T4 memory/time constraint
+    # A100 80 GB can run full 4.26M training sequences per epoch if needed.
+    # Default to 1M for ~10 min/epoch; override via config if desired.
+    epoch_size = min(int(cfg.training.get("epoch_size", 1_000_000)), len(train_idx))
     sampler, class_weights_arr = build_regime_balanced_sampler(
         labels            = y_train,
         gmm2              = gmm2_train,
@@ -570,15 +587,27 @@ def main(cfg: DictConfig) -> None:
     batch_size  = cfg.training.batch_size
     num_workers = cfg.training.num_workers
 
+    pin_memory         = bool(cfg.training.get("pin_memory", False))
+    persistent_workers = bool(cfg.training.get("persistent_workers", False)) and num_workers > 0
+    prefetch_factor    = int(cfg.training.get("prefetch_factor", 2)) if num_workers > 0 else None
+
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size,
-        sampler=sampler, num_workers=num_workers, pin_memory=False,
+        train_ds, batch_size=batch_size, sampler=sampler,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, num_workers=num_workers, pin_memory=False,
+        val_ds, batch_size=batch_size * 2,   # A100: val uses 2× batch — no grad
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
     test_loader = DataLoader(
-        test_ds, batch_size=batch_size, num_workers=num_workers, pin_memory=False,
+        test_ds, batch_size=batch_size * 2,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
     logger.info(
         f"Train: {len(train_idx):,}  Val: {len(val_idx):,}  Test: {len(test_idx):,} | "
@@ -587,7 +616,16 @@ def main(cfg: DictConfig) -> None:
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = DualBranchModel.from_config(cfg.model)
-    logger.info(f"Model: {sum(p.numel() for p in model.parameters()):,} params")
+    n_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Model: {n_params:,} params")
+
+    # A100: torch.compile gives 10-30% throughput gain on PyTorch ≥ 2.0
+    if hasattr(torch, "compile") and device.type == "cuda":
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            logger.info("torch.compile enabled (mode=reduce-overhead)")
+        except Exception as e:
+            logger.warning(f"torch.compile failed — running eager: {e}")
 
     trainer = Trainer(cfg, model, device, class_weights=class_weights_arr)
 
