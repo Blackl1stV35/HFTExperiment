@@ -2,20 +2,19 @@ name: dual_branch
 type: dual_branch
 
 input:
-  feature_dim: 10       # 6-OHLCV + 4-micro (bar_return, wick_asym, vol_z, spread_press)
-  sequence_length: 240  # 4 hours M1 — full divergence range for spread_pressure
+  feature_dim: 10       # 6-OHLCV + 4-micro
+  sequence_length: 240  # 4 hours M1
 
-d_model: 192
+d_model: 256            # A100: was 192 — larger model fits in 80 GB HBM2e
 
 price:
-  # ScatterTCNPriceBranch params (Candidate B)
-  scatter_J: 3          # frequency scales
-  scatter_Q: 4          # learnable filters per scale
-  filter_len: 31        # FIR kernel length
-  tcn_layers: 4         # CausalTCN layers after scattering
-  attn_window: 20       # LocalCausalAttention window (last-20-bar signal)
+  scatter_J: 3
+  scatter_Q: 4
+  filter_len: 31
+  tcn_layers: 4
+  attn_window: 20
   dropout: 0.1
-  # Legacy keys kept for backward compat with fusion.py from_config
+  # Legacy compat keys
   inception_channels: 128
   n_inception_blocks: 2
   kernel_sizes: [3, 5, 7, 11]
@@ -27,10 +26,10 @@ sentiment:
   dropout: 0.3
 
 fusion:
-  heads: 4
+  heads: 8              # A100: was 4 — more heads for d_model=256
   dropout: 0.1
 
 classifier:
-  hidden_dims: [128, 64]
+  hidden_dims: [256, 128]   # A100: was [128, 64] — wider classifier
   dropout: 0.4
   n_classes: 3
