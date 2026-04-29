@@ -467,53 +467,90 @@ def main(cfg: DictConfig) -> None:
     except Exception as e:
         logger.warning(f"W&B not available: {e}")
 
-    # ── Load M1 data ──────────────────────────────────────────────────────────
-    store  = TickStore(cfg.paths.data_dir + "/ticks.duckdb")
-    df_raw = store.query_ohlcv(cfg.data.symbol, cfg.data.timeframe)
-    store.close()
-    if df_raw.is_empty():
-        logger.error("No data. Run scripts/download_data.py first.")
-        return
-
-    regime_csv = Path(cfg.paths.data_dir) / "regime" / "daily_regime_labels.csv"
-    df_raw     = join_regime_labels(df_raw, regime_csv)
-    timestamps = df_raw["timestamp"].to_list() if "timestamp" in df_raw.columns else None
-
-    features, close_prices, high_prices, low_prices = prepare_features(
-        df_raw,
-        scaler_method = cfg.data.preprocessing.scaling,
-        window_size   = cfg.data.preprocessing.window_size,
-    )
+    # ── Data loading — single precomputed .npz (fastest) or full pipeline ───
+    # Priority:
+    #   1. training_ready.npz  — precomputed locally, ~8 s load, no preprocessing
+    #   2. Full pipeline       — DuckDB → regime join → scaler → labeller (~10 min)
+    #
+    # To use (1): run scripts/precompute_features.py locally, upload .npz to Drive,
+    # then set paths.training_ready in config or pass +paths.training_ready=<path>
     ws = cfg.data.preprocessing.window_size
 
-    gmm2_raw     = None
-    vol_raw      = None
-    ts_raw       = None
-    if "gmm2_state" in df_raw.columns:
-        gmm2_raw = df_raw["gmm2_state"].to_numpy()[ws:]
-        if timestamps:
-            ts_raw = timestamps[ws:]
-    if "vol_regime_enc" in df_raw.columns:
-        vol_raw = df_raw["vol_regime_enc"].to_numpy()[ws:]
+    _ready_path = cfg.paths.get("training_ready", None)
+    # Auto-detect from Drive if not set in config
+    if _ready_path is None:
+        _drive_ready = Path("/content/drive/MyDrive/Colab Notebooks/training_ready.npz")
+        if _drive_ready.exists():
+            _ready_path = str(_drive_ready)
 
-    label_cfg = LabelConfig(
-        method             = cfg.data.labeling.method,
-        profit_target_pips = cfg.data.labeling.profit_target_pips,
-        stop_loss_pips     = cfg.data.labeling.stop_loss_pips,
-        max_holding_bars   = cfg.data.labeling.max_holding_bars,
-        pip_value          = cfg.data.labeling.pip_value,
-    )
-    # Pass high/low to ATR labeller; other labellers accept but ignore them
-    from src.training.labels import ATRAdaptiveLabeler
-    _labeler = get_labeler(label_cfg)
-    if isinstance(_labeler, ATRAdaptiveLabeler):
-        labels = _labeler.label(close_prices, high_prices, low_prices)
+    if _ready_path and Path(_ready_path).exists():
+        # ── Fast path: load precomputed .npz (~8 s) ───────────────────────
+        logger.info(f"Loading precomputed training_ready: {_ready_path}")
+        _d = np.load(_ready_path, allow_pickle=True)
+        features     = _d["features"]       # (N, 10) float32
+        labels       = _d["labels"]         # (N,)    int64
+        close_prices = _d["close"]          # (N,)    float64
+        high_prices  = _d["high"]           # (N,)    float64
+        low_prices   = _d["low"]            # (N,)    float64
+        gmm2_raw     = _d["gmm2"]           # (N,)    float32
+        vol_raw      = _d["vol_enc"]        # (N,)    float32
+        ts_raw       = None                 # timestamps handled separately
+        if "timestamps_ns" in _d:
+            import pandas as pd
+            ts_raw = pd.to_datetime(_d["timestamps_ns"]).to_pydatetime().tolist()
+        meta = str(_d["metadata"]) if "metadata" in _d else "{}"
+        logger.info(
+            f"  Loaded {len(features):,} sequences | "
+            f"features={features.shape} | "
+            f"sell={np.sum(labels==0):,} hold={np.sum(labels==1):,} "
+            f"buy={np.sum(labels==2):,}"
+        )
+
     else:
-        labels = _labeler.label(close_prices)
-    features    = features[ws:]
-    labels      = labels[ws:]
-    if high_prices is not None: high_prices = high_prices[ws:]
-    if low_prices  is not None: low_prices  = low_prices[ws:]
+        # ── Full pipeline fallback ────────────────────────────────────────
+        logger.info("training_ready.npz not found — running full preprocessing pipeline")
+        logger.info("  Tip: run scripts/precompute_features.py locally to avoid this")
+
+        import polars as pl
+        store  = TickStore(cfg.paths.data_dir + "/ticks.duckdb")
+        df_raw = store.query_ohlcv(cfg.data.symbol, cfg.data.timeframe)
+        store.close()
+        if df_raw.is_empty():
+            logger.error("No data. Run scripts/download_data.py first.")
+            return
+
+        regime_csv = Path(cfg.paths.data_dir) / "regime" / "daily_regime_labels.csv"
+        df_raw     = join_regime_labels(df_raw, regime_csv)
+        timestamps = df_raw["timestamp"].to_list() if "timestamp" in df_raw.columns else None
+
+        features, close_prices, high_prices, low_prices = prepare_features(
+            df_raw,
+            scaler_method = cfg.data.preprocessing.scaling,
+            window_size   = ws,
+        )
+
+        gmm2_raw = df_raw["gmm2_state"].to_numpy()[ws:]                    if "gmm2_state" in df_raw.columns else None
+        vol_raw  = df_raw["vol_regime_enc"].to_numpy()[ws:]                    if "vol_regime_enc" in df_raw.columns else None
+        ts_raw   = timestamps[ws:] if timestamps and gmm2_raw is not None else None
+
+        label_cfg = LabelConfig(
+            method             = cfg.data.labeling.method,
+            profit_target_pips = cfg.data.labeling.profit_target_pips,
+            stop_loss_pips     = cfg.data.labeling.stop_loss_pips,
+            max_holding_bars   = cfg.data.labeling.max_holding_bars,
+            pip_value          = cfg.data.labeling.pip_value,
+        )
+        from src.training.labels import ATRAdaptiveLabeler
+        _labeler = get_labeler(label_cfg)
+        if isinstance(_labeler, ATRAdaptiveLabeler):
+            labels = _labeler.label(close_prices, high_prices, low_prices)
+        else:
+            labels = _labeler.label(close_prices)
+
+        features     = features[ws:]
+        labels       = labels[ws:]
+        if high_prices is not None: high_prices = high_prices[ws:]
+        if low_prices  is not None: low_prices  = low_prices[ws:]
 
     sentiment = None
     if cfg.data.sentiment.enabled:

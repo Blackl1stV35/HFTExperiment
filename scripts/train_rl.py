@@ -397,15 +397,30 @@ def main():
     if not ckpt_path.exists():
         logger.error(f"Checkpoint not found: {ckpt_path}"); sys.exit(1)
 
-    store = TickStore(f"{args.data_dir}/ticks.duckdb")
-    df    = store.query_ohlcv(args.symbol, "M1"); store.close()
-    if df.is_empty(): logger.error("No data."); sys.exit(1)
-
-    df = join_regime_labels(df, args.regime_csv)
-    regime_arr_full = get_regime_array(df)
-    features, close_prices, _, _ = prepare_features(df, window_size=args.window_size)
+    # Fast path: precomputed .npz (~8 s) vs full pipeline (~10 min)
     ws = args.window_size
-    features = features[ws:]; close_prices = close_prices[ws:]; regime_arr = regime_arr_full[ws:]
+    _ready = Path("/content/drive/MyDrive/Colab Notebooks/training_ready.npz")
+    if _ready.exists():
+        logger.info(f"Loading precomputed training_ready: {_ready}")
+        _d           = np.load(str(_ready), allow_pickle=True)
+        features     = _d["features"]       # already trimmed by ws
+        close_prices = _d["close"]
+        # Reconstruct 6-col regime array from individual arrays
+        regime_arr   = np.stack([
+            _d["gmm2"], _d["km_enc"], _d["vol_enc"],
+            _d["gs_q"], _d["cu_au"], _d["rq"]
+        ], axis=1).astype(np.float32)
+        logger.info(f"  Loaded {len(features):,} sequences from cache")
+    else:
+        logger.info("training_ready.npz not found — running full pipeline")
+        store = TickStore(f"{args.data_dir}/ticks.duckdb")
+        df    = store.query_ohlcv(args.symbol, "M1"); store.close()
+        if df.is_empty(): logger.error("No data."); sys.exit(1)
+        df = join_regime_labels(df, args.regime_csv)
+        regime_arr_full = get_regime_array(df)
+        features, close_prices, _, _ = prepare_features(df, window_size=ws)
+        features = features[ws:]; close_prices = close_prices[ws:]
+        regime_arr = regime_arr_full[ws:]
 
     sl = args.seq_length; n_seq = len(features) - sl
     seq_prices = close_prices[sl-1:sl-1+n_seq]; seq_regime = regime_arr[sl-1:sl-1+n_seq]
