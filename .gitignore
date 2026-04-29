@@ -23,3 +23,8 @@ multirun/
 .DS_Store
 *.ipynb_checkpoints/
 rust_inference/target/
+
+# commit after finalize traing and back testing done
+STEP_BY_STEP.md
+Dockerfile
+Makefile
