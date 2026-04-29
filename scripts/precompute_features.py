@@ -154,31 +154,37 @@ def main():
     logger.info(f"  Bull={gmm2.mean():.1%}  Bear={1-gmm2.mean():.1%}  "
                 f"done in {time.time()-t0:.1f}s")
 
-    # ── 6. Timestamps ────────────────────────────────────────────────────────
-    logger.info("Extracting timestamps...")
+    # ── 6. Timestamps — weekday-filtered to match prepare_features output ────
+    # prepare_features filters weekdays internally (5,998,591 → 5,680,771 bars).
+    # Raw df has weekend bars so df["timestamp"][ws:] has wrong length.
+    # Fix: filter df to weekdays first, then slice ws: to match `close` length.
+    import pandas as pd
+    import polars as pl
+    logger.info("Extracting timestamps (weekday-filtered)...")
     t0 = time.time()
-    if "timestamp" in df.columns:
-        import pandas as pd
-        ts_list = df["timestamp"].to_list()[ws:]
+    df_wd = df.filter(pl.col("timestamp").dt.weekday().is_in([1, 2, 3, 4, 5]))
+    if "timestamp" in df_wd.columns:
+        ts_list = df_wd["timestamp"].to_list()[ws:]
+        if len(ts_list) != n:
+            raise ValueError(
+                f"Timestamp/features mismatch: {len(ts_list)} vs {n} — "
+                "check weekday filter consistency"
+            )
         timestamps_ns = np.array(
             [int(pd.Timestamp(t).value) for t in ts_list], dtype=np.int64
         )
     else:
         timestamps_ns = np.zeros(n, dtype=np.int64)
         logger.warning("No timestamp column — session_phase will be 0.5")
-    logger.info(f"  Timestamps done in {time.time()-t0:.1f}s")
+    logger.info(f"  Timestamps {len(timestamps_ns):,} done in {time.time()-t0:.1f}s")
 
     # ── 7. RL observation context features (atr_norm, trend, session) ────────
     logger.info("Computing RL obs context features...")
     t0 = time.time()
-
-    # Reconstruct Python datetime list for session_phase (only needed once)
     if timestamps_ns.any():
-        import pandas as pd
         ts_dt = pd.to_datetime(timestamps_ns).to_pydatetime().tolist()
     else:
         ts_dt = None
-
     atr_norm, trend_norm, session_phase = compute_rl_obs_features(close, ts_dt)
     logger.info(f"  RL features done in {time.time()-t0:.1f}s")
 

@@ -24,7 +24,7 @@ multirun/
 *.ipynb_checkpoints/
 rust_inference/target/
 
-# commit after finalize traing and back testing done
+# note: commit after finishing training pipelines
 STEP_BY_STEP.md
 Dockerfile
 Makefile
