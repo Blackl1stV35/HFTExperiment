@@ -18,12 +18,12 @@ training:
   gradient_clip: 10.0
   focal_gamma: 1.0
   mixed_precision: true     # bf16 on A100 — free ~20% throughput
-  num_workers: 10           # A100 instances have 12+ CPU cores
+  num_workers: 0            # GPU-pinned dataset: no CPU work to parallelise
   val_split: 0.15
   test_split: 0.10
-  pin_memory: true          # PCIe pinned transfer to A100 HBM2e
-  persistent_workers: true  # keep workers alive across epochs
-  prefetch_factor: 4        # pipeline CPU↔GPU overlap
+  pin_memory: false         # data lives on GPU — PCIe pin not needed
+  persistent_workers: false
+  prefetch_factor: 2        # unused when num_workers=0
 
 logging:
   wandb_project: xauusd-v2

@@ -37,6 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from src.training.dataset import GPUPinnedSequenceDataset, GPUPinnedIndexedDataset
 from loguru import logger
 
 from src.encoder.fusion import DualBranchModel
@@ -592,27 +593,33 @@ def main(cfg: DictConfig) -> None:
         bull = gmm2_train.mean()
         logger.info(f"GMM2 train: Bull={bull:.1%}  Bear={1-bull:.1%}")
 
-    # Build datasets using index-based slicing via a wrapper
-    class IndexedDataset(Dataset):
-        """Wraps SequenceDataset to expose a subset by index array."""
-        def __init__(self, base: SequenceDataset, indices: np.ndarray):
-            self.base    = base
-            self.indices = indices
-        def __len__(self):
-            return len(self.indices)
-        def __getitem__(self, i):
-            return self.base[int(self.indices[i])]
+    # ── GPU-Pinned Dataset (Phase 4 I/O optimisation) ────────────────────────
+    # Transfer features (215 MB) + labels (45 MB) to GPU HBM2e once.
+    # All sequence slicing happens at GPU memory bandwidth (2 TB/s) — no PCIe.
+    # num_workers=0 is correct: no CPU work remains to parallelise.
+    # Expected GPU utilisation improvement: 40% → 85-90%.
+    logger.info("Pinning features and labels to GPU HBM2e...")
+    _t_pin = __import__("time").time()
+    base_ds = GPUPinnedSequenceDataset(
+        features  = features,
+        labels    = labels,
+        seq_len   = seq_len,
+        device    = device,
+        sentiment = sentiment,
+        dtype     = torch.float32,
+    )
+    _pin_mb = (base_ds._features.nbytes + base_ds._labels.nbytes) / 1024**2
+    logger.info(
+        f"  Pinned {_pin_mb:.0f} MB to {device} in "
+        f"{__import__('time').time()-_t_pin:.1f}s"
+    )
 
-    base_ds   = SequenceDataset(features, labels, seq_len, sentiment)
-    train_ds  = IndexedDataset(base_ds, train_idx)
-    val_ds    = IndexedDataset(base_ds, val_idx)
-    test_ds   = IndexedDataset(base_ds, test_idx)
+    train_ds = GPUPinnedIndexedDataset(base_ds, train_idx)
+    val_ds   = GPUPinnedIndexedDataset(base_ds, val_idx)
+    test_ds  = GPUPinnedIndexedDataset(base_ds, test_idx)
 
     # ── Regime-balanced sampler ───────────────────────────────────────────────
     cw_cfg     = list(cfg.data.labeling.get("class_weights", [])) or None
-    # A100: raise epoch_size — 500k was a T4 memory/time constraint
-    # A100 80 GB can run full 4.26M training sequences per epoch if needed.
-    # Default to 1M for ~10 min/epoch; override via config if desired.
     epoch_size = min(int(cfg.training.get("epoch_size", 1_000_000)), len(train_idx))
     sampler, class_weights_arr = build_regime_balanced_sampler(
         labels            = y_train,
@@ -622,32 +629,24 @@ def main(cfg: DictConfig) -> None:
         epoch_size        = epoch_size,
     )
 
-    # ── DataLoaders ───────────────────────────────────────────────────────────
-    batch_size  = cfg.training.batch_size
+    # ── DataLoaders — num_workers=0, no pin_memory (data already on GPU) ─────
+    batch_size = cfg.training.batch_size
     num_workers = cfg.training.num_workers
-
-    pin_memory         = bool(cfg.training.get("pin_memory", False))
-    persistent_workers = bool(cfg.training.get("persistent_workers", False)) and num_workers > 0
-    prefetch_factor    = int(cfg.training.get("prefetch_factor", 2)) if num_workers > 0 else None
+    pin_memory = cfg.training.pin_memory
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, sampler=sampler,
         num_workers=num_workers, pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size * 2,   # A100: val uses 2× batch — no grad
+        val_ds, batch_size=batch_size * 2,
         num_workers=num_workers, pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
     )
     test_loader = DataLoader(
         test_ds, batch_size=batch_size * 2,
         num_workers=num_workers, pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
     )
+
     logger.info(
         f"Train: {len(train_idx):,}  Val: {len(val_idx):,}  Test: {len(test_idx):,} | "
         f"batch={batch_size}  workers={num_workers}  epoch_size={epoch_size:,}"
