@@ -11,6 +11,7 @@ build/
 data/*.duckdb
 data/*.csv
 data/*.npy
+data/*.npz
 data/sentiment_cache/
 data/ft_cache/
 models/*.pt
