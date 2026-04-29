@@ -140,11 +140,21 @@ def main():
                 f"sell={np.sum(labels==0):,} hold={np.sum(labels==1):,} "
                 f"buy={np.sum(labels==2):,}")
 
-    # ── 5. Regime arrays (aligned to trimmed sequences) ──────────────────────
+    # ── 5. Build weekday-filtered df once — used for BOTH regime + timestamps ─
+    # prepare_features filters weekdays internally → 5,680,771 bars.
+    # df (raw) has 5,998,591 bars including weekends.
+    # get_regime_array and timestamp extraction must use the same filtered view.
+    import polars as pl
+    import pandas as pd
+    df_wd = df.filter(pl.col("timestamp").dt.weekday().is_in([1, 2, 3, 4, 5]))
+    assert len(df_wd) == len(features) + ws,         f"Weekday df length {len(df_wd)} != features {len(features)+ws}"
+
+    # ── 6. Regime arrays (from weekday-filtered df) ──────────────────────────
     logger.info("Extracting regime arrays...")
     t0 = time.time()
-    regime_full = get_regime_array(df)              # (N_bars, 6)
-    regime      = regime_full[ws:]                  # (n, 6)
+    regime_full = get_regime_array(df_wd)            # (5680771, 6)
+    regime      = regime_full[ws:]                   # (n, 6)
+    assert len(regime) == n, f"Regime length {len(regime)} != n {n}"
     gmm2    = regime[:, 0]
     km_enc  = regime[:, 1]
     vol_enc = regime[:, 2]
@@ -154,15 +164,9 @@ def main():
     logger.info(f"  Bull={gmm2.mean():.1%}  Bear={1-gmm2.mean():.1%}  "
                 f"done in {time.time()-t0:.1f}s")
 
-    # ── 6. Timestamps — weekday-filtered to match prepare_features output ────
-    # prepare_features filters weekdays internally (5,998,591 → 5,680,771 bars).
-    # Raw df has weekend bars so df["timestamp"][ws:] has wrong length.
-    # Fix: filter df to weekdays first, then slice ws: to match `close` length.
-    import pandas as pd
-    import polars as pl
+    # ── 7. Timestamps (from df_wd already built above) ─────────────────────
     logger.info("Extracting timestamps (weekday-filtered)...")
     t0 = time.time()
-    df_wd = df.filter(pl.col("timestamp").dt.weekday().is_in([1, 2, 3, 4, 5]))
     if "timestamp" in df_wd.columns:
         ts_list = df_wd["timestamp"].to_list()[ws:]
         if len(ts_list) != n:
@@ -178,7 +182,7 @@ def main():
         logger.warning("No timestamp column — session_phase will be 0.5")
     logger.info(f"  Timestamps {len(timestamps_ns):,} done in {time.time()-t0:.1f}s")
 
-    # ── 7. RL observation context features (atr_norm, trend, session) ────────
+    # ── 8. RL observation context features (atr_norm, trend, session) ────────
     logger.info("Computing RL obs context features...")
     t0 = time.time()
     if timestamps_ns.any():
@@ -188,7 +192,7 @@ def main():
     atr_norm, trend_norm, session_phase = compute_rl_obs_features(close, ts_dt)
     logger.info(f"  RL features done in {time.time()-t0:.1f}s")
 
-    # ── 8. Save single .npz ──────────────────────────────────────────────────
+    # ── 9. Save single .npz ──────────────────────────────────────────────────
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
