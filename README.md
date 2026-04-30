@@ -1,5 +1,29 @@
 ## Underdevelopment 
 
+## Phase 5 Architecture (not finalised)
+
+```
+Input (B, 240, 10)
+    ↓
+LearnableScatteringBlock(J=3, Q=4)    ← KEEP: validated discriminative signal
+    → (B, 120, 104)
+    ↓
+scatter_proj: Linear(104, 512)
+    → (B, 120, 512)
+    ↓
+TransformerEncoder(
+    d_model=512, n_heads=8, ffn_dim=2048,
+    n_layers=4, dropout=0.1,
+    is_causal=True                    ← causal mask, static shapes ✓
+)   → (B, 120, 512)
+    ↓
+Attention-weighted pool → (B, 512)
+
+Short stream (wick_asym, vol_z): unchanged LocalCausalAttention(w=20)
+    ↓
+Fusion: Linear(512+512, 512) → LayerNorm → GELU
+```
+
 ## Project Structure (not finalised)
 
 ```
