@@ -4,7 +4,7 @@
 
 Digram Sketch
 <p align="center">
-  <img src="/asset/v0.5.1-PriceBranchTransformer-ScatterPool.png" alt="Price Branch Transformer Scatter Pool" width="600"/>
+  <img src="/assets/v0.5.1-PriceBranchTransformer-ScatterPool.png" alt="Price Branch Transformer Scatter Pool" width="600"/>
 </p>
 
 ```
