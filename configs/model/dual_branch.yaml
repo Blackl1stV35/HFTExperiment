@@ -2,22 +2,27 @@ name: dual_branch
 type: dual_branch
 
 input:
-  feature_dim: 10       # 6-OHLCV + 4-micro
-  sequence_length: 240  # 4 hours M1
+  feature_dim: 10        # 6-OHLCV + 4-micro
+  sequence_length: 240   # 4 hours M1 — scatter pool=2 → T_s=120 tokens
 
-d_model: 256            # A100: was 192 — larger model fits in 80 GB HBM2e
+d_model: 512             # Phase 5: Transformer (was 256 ScatterTCN)
 
 price:
-  scatter_J: 3
-  scatter_Q: 4
+  # Transformer encoder params
+  n_heads:    8
+  ffn_dim:    2048        # 4 × d_model
+  n_layers:   4
+  dropout:    0.1
+  attn_window: 20         # short-stream local attention
+  # Scattering front-end (retained from Phase 4)
+  scatter_J:  3
+  scatter_Q:  4
   filter_len: 31
-  tcn_layers: 4
-  attn_window: 20
-  dropout: 0.1
-  # Legacy compat keys
+  # Legacy compat keys (ignored by TransformerPriceBranch)
   inception_channels: 128
   n_inception_blocks: 2
   kernel_sizes: [3, 5, 7, 11]
+  tcn_layers: 4
   tcn_kernel_size: 3
 
 sentiment:
@@ -26,10 +31,10 @@ sentiment:
   dropout: 0.3
 
 fusion:
-  heads: 8              # A100: was 4 — more heads for d_model=256
+  heads: 8               # 8 heads for d_model=512
   dropout: 0.1
 
 classifier:
-  hidden_dims: [256, 128]   # A100: was [128, 64] — wider classifier
+  hidden_dims: [256, 128]
   dropout: 0.4
   n_classes: 3

@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.encoder.price_branch_scatter_tcn import PriceBranch  # Candidate B
+from src.encoder.price_branch_transformer import PriceBranch  # Phase 5
 from src.encoder.sentiment_branch import SentimentBranch
 
 
@@ -100,20 +100,25 @@ class DualBranchModel(nn.Module):
 
     def __init__(
         self,
-        # Price branch — accepts both ScatterTCN and legacy InceptionBlock params
-        input_dim: int = 10,            # 10-dim for Phase 4
-        inception_channels: int = 128,
-        n_inception_blocks: int = 2,
-        kernel_sizes: list[int] = [3, 5, 7, 11],
-        tcn_layers: int = 4,
-        tcn_kernel_size: int = 3,
+        # Price branch — Transformer (Phase 5) + legacy compat
+        input_dim:    int   = 10,
+        d_model:      int   = 512,
+        # Transformer params
+        n_heads:      int   = 8,
+        ffn_dim:      int   = 2048,
+        n_layers:     int   = 4,
+        # Scattering front-end (retained)
+        scatter_J:    int   = 3,
+        scatter_Q:    int   = 4,
+        filter_len:   int   = 31,
+        attn_window:  int   = 20,
         price_dropout: float = 0.1,
-        d_model: int = 192,
-        # ScatterTCN-specific (ignored by old PriceBranch via **_kwargs)
-        scatter_J: int = 3,
-        scatter_Q: int = 4,
-        filter_len: int = 31,
-        attn_window: int = 20,
+        # Legacy compat kwargs (forwarded to **_kwargs, not used by Transformer)
+        inception_channels: int   = 128,
+        n_inception_blocks: int   = 2,
+        kernel_sizes: list[int]   = [3, 5, 7, 11],
+        tcn_layers:   int   = 4,
+        tcn_kernel_size: int = 3,
         # Sentiment branch
         sentiment_input_dim: int = 768,
         sentiment_hidden_dim: int = 256,
@@ -128,21 +133,24 @@ class DualBranchModel(nn.Module):
     ):
         super().__init__()
 
-        # Price branch: ScatterTCN (Candidate B) or InceptionBlock via **_kwargs
+        # Price branch: TransformerPriceBranch (Phase 5)
         self.price_branch = PriceBranch(
-            input_dim=input_dim,
-            d_model=d_model,
-            scatter_J=scatter_J,
-            scatter_Q=scatter_Q,
-            filter_len=filter_len,
-            tcn_layers=tcn_layers,
-            attn_window=attn_window,
-            dropout=price_dropout,
-            # Legacy forwarded (absorbed if not used)
-            inception_channels=inception_channels,
-            n_inception_blocks=n_inception_blocks,
-            kernel_sizes=kernel_sizes,
-            tcn_kernel_size=tcn_kernel_size,
+            input_dim    = input_dim,
+            d_model      = d_model,
+            n_heads      = n_heads,
+            ffn_dim      = ffn_dim,
+            n_layers     = n_layers,
+            scatter_J    = scatter_J,
+            scatter_Q    = scatter_Q,
+            filter_len   = filter_len,
+            attn_window  = attn_window,
+            dropout      = price_dropout,
+            # Legacy forwarded → **_kwargs in TransformerPriceBranch
+            inception_channels = inception_channels,
+            n_inception_blocks = n_inception_blocks,
+            kernel_sizes       = kernel_sizes,
+            tcn_layers         = tcn_layers,
+            tcn_kernel_size    = tcn_kernel_size,
         )
 
         # Sentiment branch: FinBERT → MLP
@@ -257,30 +265,34 @@ class DualBranchModel(nn.Module):
 
     @classmethod
     def from_config(cls, cfg) -> "DualBranchModel":
-        """Build from Hydra config. Passes all price params; ScatterTCN branch
-        accepts legacy inception/tcn keys and maps them via **_kwargs."""
+        """Build from Hydra config. Passes all price params.
+        TransformerPriceBranch accepts legacy keys via **_kwargs."""
         price_cfg = cfg.price
         return cls(
-            input_dim=cfg.input.feature_dim,
-            # ScatterTCN-specific params (passed if present, ignored otherwise)
-            scatter_J   =getattr(price_cfg, "scatter_J",    3),
-            scatter_Q   =getattr(price_cfg, "scatter_Q",    4),
-            filter_len  =getattr(price_cfg, "filter_len",   31),
-            tcn_layers  =getattr(price_cfg, "tcn_layers",   4),
-            attn_window =getattr(price_cfg, "attn_window",  20),
-            # Legacy keys forwarded (absorbed by **_kwargs if not used)
-            inception_channels=getattr(price_cfg, "inception_channels", 128),
-            n_inception_blocks=getattr(price_cfg, "n_inception_blocks", 2),
-            kernel_sizes=getattr(price_cfg, "kernel_sizes", [3,5,7,11]),
-            tcn_kernel_size=getattr(price_cfg, "tcn_kernel_size", 3),
-            price_dropout=price_cfg.dropout,
-            d_model=cfg.d_model,
-            sentiment_input_dim=cfg.sentiment.input_dim,
-            sentiment_hidden_dim=cfg.sentiment.hidden_dim,
-            sentiment_dropout=cfg.sentiment.dropout,
-            fusion_heads=cfg.fusion.heads,
-            fusion_dropout=cfg.fusion.dropout,
-            classifier_dims=cfg.classifier.hidden_dims,
-            classifier_dropout=cfg.classifier.dropout,
-            n_classes=cfg.classifier.n_classes,
+            input_dim    = cfg.input.feature_dim,
+            d_model      = cfg.d_model,
+            # Transformer params
+            n_heads      = getattr(price_cfg, "n_heads",     8),
+            ffn_dim      = getattr(price_cfg, "ffn_dim",     2048),
+            n_layers     = getattr(price_cfg, "n_layers",    4),
+            # Scattering front-end params (retained)
+            scatter_J    = getattr(price_cfg, "scatter_J",   3),
+            scatter_Q    = getattr(price_cfg, "scatter_Q",   4),
+            filter_len   = getattr(price_cfg, "filter_len",  31),
+            attn_window  = getattr(price_cfg, "attn_window", 20),
+            price_dropout = price_cfg.dropout,
+            # Legacy keys forwarded to **_kwargs (ignored by Transformer)
+            inception_channels = getattr(price_cfg, "inception_channels", 128),
+            n_inception_blocks = getattr(price_cfg, "n_inception_blocks", 2),
+            kernel_sizes       = getattr(price_cfg, "kernel_sizes", [3,5,7,11]),
+            tcn_layers         = getattr(price_cfg, "tcn_layers", 4),
+            tcn_kernel_size    = getattr(price_cfg, "tcn_kernel_size", 3),
+            sentiment_input_dim  = cfg.sentiment.input_dim,
+            sentiment_hidden_dim = cfg.sentiment.hidden_dim,
+            sentiment_dropout    = cfg.sentiment.dropout,
+            fusion_heads    = cfg.fusion.heads,
+            fusion_dropout  = cfg.fusion.dropout,
+            classifier_dims = cfg.classifier.hidden_dims,
+            classifier_dropout = cfg.classifier.dropout,
+            n_classes = cfg.classifier.n_classes,
         )
