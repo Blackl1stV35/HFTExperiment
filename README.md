@@ -2,7 +2,7 @@
 
 ## Phase 5 Architecture (not finalised)
 
-Digram Sketch
+Digram Sketch: v0.5.1-PriceBranchTransformer-ScatterPool
 <p align="center">
   <img src="/assets/v0.5.1-PriceBranchTransformer-ScatterPool.png" alt="Phase 5 Architecture Diagram" style="max-width:100%; height:auto;"/>
 </p>
