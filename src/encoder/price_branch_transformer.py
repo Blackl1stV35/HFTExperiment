@@ -277,9 +277,10 @@ class TransformerPriceBranch(nn.Module):
             nn.Dropout(dropout),
         )
 
-        self.d_model     = d_model
-        self.out_dim     = d_model
-        self.attn_window = attn_window
+        self.d_model       = d_model
+        self.out_dim       = d_model
+        self.attn_window   = attn_window
+        self.use_checkpoint = True   # disabled at eval() automatically
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -295,8 +296,16 @@ class TransformerPriceBranch(nn.Module):
         scattered = self.scatter(x_long)              # (B, 120, 104)
         h        = self.scatter_proj(scattered)       # (B, 120, d_model)
 
-        for layer in self.encoder:
-            h = layer(h)
+        # Gradient checkpointing: recompute activations during backward
+        # instead of storing them. Saves ~24 GB at B=4096 d=512 4-layer.
+        # Cost: ~30% extra compute per backward pass — acceptable tradeoff.
+        if self.training and self.use_checkpoint:
+            from torch.utils.checkpoint import checkpoint
+            for layer in self.encoder:
+                h = checkpoint(layer, h, use_reentrant=False)
+        else:
+            for layer in self.encoder:
+                h = layer(h)
         h = self.encoder_norm(h)                      # (B, 120, d_model)
 
         long_scores  = self.long_pool(h).squeeze(-1)

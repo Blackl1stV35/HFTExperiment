@@ -700,17 +700,11 @@ def main(cfg: DictConfig) -> None:
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model: {n_params:,} params")
 
-    # torch.compile: re-enabled for Transformer (all static shapes)
-    # The TransformerEncoderLayer uses pre-built causal masks (register_buffer)
-    # and F.scaled_dot_product_attention with is_causal=False + explicit mask.
-    # All shapes are static at T_s=120, B=4096 → Inductor can fuse correctly.
-    # Expected gain: ~15% throughput improvement.
-    if hasattr(torch, "compile") and device.type == "cuda":
-        try:
-            model = torch.compile(model, mode="default")
-            logger.info("torch.compile enabled (Transformer — static shapes)")
-        except Exception as e:
-            logger.warning(f"torch.compile skipped: {e}")
+    # torch.compile disabled: adds ~1.5 GB graph intermediates — OOM on 40GB
+    # A100 with d_model=512, B=4096, gradient checkpointing active.
+    # Re-enable once memory budget is confirmed stable:
+    #   model = torch.compile(model, mode="default")
+    logger.info("torch.compile skipped (memory budget — enable after stability check)")
 
     trainer = Trainer(cfg, model, device, class_weights=class_weights_arr)
 
