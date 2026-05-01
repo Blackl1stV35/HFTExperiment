@@ -2,7 +2,11 @@
 
 ## Phase 5 Architecture 
 
-Digram Sketch: v0.5.1-PriceBranchTransformer-ScatterPool
+Digram Sketch: v0.5.3.1-PriceBranchTransformer-ScatterPool-enriched
+- Astrocyte Routing: K=16 learned pattern slots
+- Regime-Conditional Temperature ($T$)
+- Temperature Scaling: Initializing $T=1.5$ and using L-BFGS for post-training fit.
+
 <p align="center">
   <img src="/assets/v0.5.1-PriceBranchTransformer-ScatterPool.png" alt="Phase 5 Architecture Diagram" style="max-width:100%; height:auto;"/>
 </p>
