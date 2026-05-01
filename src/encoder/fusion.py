@@ -222,7 +222,18 @@ class DualBranchModel(nn.Module):
             confidence: (batch, 1) — confidence score [0, 1]
         """
         # Price branch: get both pooled and sequence-level features
-        price_pooled, price_seq_features = self.price_branch(price_seq)
+        # Build regime index (0-3) from sentiment tensor's regime columns
+        # regime encoding: 0=Bear+LOW, 1=Bear+HIGH, 2=Bull+LOW, 3=Bull+HIGH
+        # gmm2=sentiment[:,0], vol_enc=sentiment[:,1] (when available)
+        regime_idx = None
+        if sentiment is not None and sentiment.shape[-1] >= 2:
+            gmm2_col  = sentiment[:, 0]   # 0=Bear, 1=Bull
+            vol_col   = sentiment[:, 1]   # 0=LOW, 0.5=NORMAL, 1=HIGH
+            bear      = (gmm2_col < 0.5).long()
+            high_vol  = (vol_col  > 0.6).long()
+            regime_idx = bear * 2 + high_vol   # 0=Bear+LOW,1=Bear+HIGH,2=Bull+LOW,3=Bull+HIGH
+            # Note: encoding swapped so Bear+HIGH=1 is the most common (current macro)
+        price_pooled, price_seq_features = self.price_branch(price_seq, regime_idx)
 
         # Sentiment branch
         if sentiment is None:

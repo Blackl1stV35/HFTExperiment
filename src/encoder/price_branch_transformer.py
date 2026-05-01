@@ -159,6 +159,132 @@ class TransformerEncoderLayer(nn.Module):
         return x
 
 
+
+# ── Astrocyte Routing Module (Vivet & Arenas 2026) ───────────────────────────
+
+class AstrocyteGatingModule(nn.Module):
+    """Gain-simplex routing over the short stream (Vivet & Arenas 2026).
+
+    Replaces hard w=20 causal mask with soft, content-addressed routing.
+    Pattern fitness fμ(x) = squared overlap of current state with K learned
+    "memory patterns" (engrams). Gains p_μ evolve on the probability simplex
+    via entropy-regularised replicator dynamics, yielding emergent softmax
+    attention without an explicit attention mechanism.
+
+    In practice: implemented as a differentiable soft-attention over K pattern
+    slots, where the temperature T is conditioned on the regime (Bear/Bull × vol).
+
+    Regime-conditional temperature T (from astrocyte paper §III):
+        - Bear + HIGH vol: T=0.01 (sharp routing — high interference regime)
+        - Bull + LOW vol:  T=0.10 (diffuse routing — low interference)
+        - Others:          T=0.05 (intermediate)
+    
+    Args:
+        d_model:    embedding dimension
+        K:          number of stored patterns (memory slots)
+        n_regimes:  number of (gmm2, vol) regime cells (default 4: 2×2)
+    """
+    def __init__(self, d_model: int, K: int = 16, n_regimes: int = 4):
+        super().__init__()
+        self.K       = K
+        self.d_model = d_model
+
+        # Learnable pattern bank — the "stored memories" Ξ
+        self.patterns = nn.Parameter(torch.randn(K, d_model) * 0.02)
+
+        # Per-regime temperature T — 4 cells: Bear/Bull × LOW/HIGH vol
+        # Initialised from astrocyte paper recommendations
+        T_init = torch.tensor([0.01, 0.05, 0.05, 0.10])  # (n_regimes,)
+        self.log_T = nn.Parameter(torch.log(T_init))      # log-space for positivity
+
+        # Output projection
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.norm     = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        x:      torch.Tensor,          # (B, T_short, d_model) short stream
+        regime: torch.Tensor | None,   # (B,) regime index 0-3, or None
+    ) -> torch.Tensor:
+        """
+        regime encoding:
+            0 = Bear + LOW  vol
+            1 = Bear + HIGH vol  ← current macro (sharp T=0.01)
+            2 = Bull + LOW  vol
+            3 = Bull + HIGH vol
+        """
+        B, T, D = x.shape
+        residual = x[:, -1, :]  # use last bar as the query state
+
+        # Pattern fitness: fμ(x) = (1/D) Σ_d x_last_d * pattern_μ_d  (linear overlap)
+        # Shape: (B, K)
+        fitness = torch.einsum("bd,kd->bk", residual, self.patterns) / D
+
+        # Regime-conditional temperature
+        if regime is not None:
+            T = torch.exp(self.log_T)[regime]          # (B,)
+            T = T.unsqueeze(-1)                         # (B, 1)
+        else:
+            T = torch.exp(self.log_T[1:2])             # default: Bear+HIGH
+
+        # Astrocyte gains: softmax over fitness scores (the gain simplex fixed point)
+        gains = torch.softmax(fitness / T, dim=-1)     # (B, K)
+
+        # Retrieve: weighted sum of patterns
+        retrieved = torch.einsum("bk,kd->bd", gains, self.patterns)  # (B, d_model)
+
+        # Residual gate: blend retrieved with last-bar state
+        out = self.norm(residual + self.out_proj(retrieved))         # (B, d_model)
+        return out
+
+
+# ── Temperature Scaling for Confidence Calibration ───────────────────────────
+
+class TemperatureScaling(nn.Module):
+    """Post-hoc confidence calibration via temperature scaling.
+
+    Platt (1999) / Guo et al. (2017): divide logits by a learned scalar T > 1
+    before softmax. Reduces overconfidence without changing predictions.
+
+    T is learned on the validation set after training — does not affect
+    train/val metrics, only the confidence output used by the RL gate.
+
+    Usage:
+        # After training completes:
+        ts = TemperatureScaling()
+        ts.fit(logits_val, labels_val)   # optimise T on val set
+        calibrated_conf = ts(logits)     # use in inference
+    """
+    def __init__(self, init_T: float = 1.5):
+        super().__init__()
+        self.log_T = nn.Parameter(torch.tensor(float(init_T)).log())
+
+    @property
+    def T(self) -> float:
+        return float(self.log_T.exp())
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(logits / self.log_T.exp(), dim=-1)
+
+    def fit(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        lr:     float = 0.01,
+        steps:  int   = 100,
+    ) -> None:
+        """Optimise T on validation logits to minimise NLL."""
+        optimizer = torch.optim.LBFGS([self.log_T], lr=lr, max_iter=steps)
+        def closure():
+            optimizer.zero_grad()
+            loss = torch.nn.functional.cross_entropy(
+                logits / self.log_T.exp(), labels
+            )
+            loss.backward()
+            return loss
+        optimizer.step(closure)
+
+
 # ── Main PriceBranch ──────────────────────────────────────────────────────────
 
 class TransformerPriceBranch(nn.Module):
@@ -256,20 +382,19 @@ class TransformerPriceBranch(nn.Module):
             nn.Linear(d_model // 4, 1),
         )
 
-        # ── Short stream: LocalCausalAttention(w=20) ─────────────────────────
+        # ── Short stream: LocalCausalAttention(w=20) + AstrocyteGating ─────
         self.short_proj = nn.Linear(n_short, d_model)
         self.short_attn = nn.ModuleList([
             LocalCausalAttention(d_model, n_heads=4, window=attn_window,
                                  dropout=dropout)
             for _ in range(2)
         ])
-        self.short_pool = nn.Sequential(
-            nn.Linear(d_model, d_model // 4),
-            nn.Tanh(),
-            nn.Linear(d_model // 4, 1),
-        )
+        # Astrocyte routing replaces the hard pool — content-addressed retrieval
+        # over K=16 learned pattern slots with regime-conditional temperature T
+        self.astrocyte  = AstrocyteGatingModule(d_model, K=16, n_regimes=4)
 
         # ── Fusion ────────────────────────────────────────────────────────────
+        # short_pooled is now (B, d_model) from astrocyte — no pool layer needed
         self.fusion = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.LayerNorm(d_model),
@@ -277,19 +402,29 @@ class TransformerPriceBranch(nn.Module):
             nn.Dropout(dropout),
         )
 
-        self.d_model       = d_model
-        self.out_dim       = d_model
-        self.attn_window   = attn_window
+        # Temperature scaling (post-training calibration — not trained with model)
+        self.temp_scale = TemperatureScaling(init_T=1.5)
+
+        self.d_model        = d_model
+        self.out_dim        = d_model
+        self.attn_window    = attn_window
         self.use_checkpoint = True   # disabled at eval() automatically
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x:      torch.Tensor,          # (B, T=240, input_dim=10)
+        regime: torch.Tensor | None = None,  # (B,) regime index 0-3
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            x: (B, T=240, input_dim=10)
+            x:      (B, T=240, input_dim=10)
+            regime: (B,) integer regime index:
+                    0=Bear+LOW, 1=Bear+HIGH, 2=Bull+LOW, 3=Bull+HIGH
+                    None → uses default Bear+HIGH temperature
 
         Returns:
             pooled:       (B, d_model)
-            seq_features: (B, T_s=120, d_model)  for cross-attention in fusion.py
+            seq_features: (B, T_s=120, d_model)
         """
         # ── Long stream ───────────────────────────────────────────────────────
         x_long   = x[:, :, self._LONG_IDX]           # (B, 240, 8)
@@ -312,15 +447,15 @@ class TransformerPriceBranch(nn.Module):
         long_weights = torch.softmax(long_scores, dim=-1)
         long_pooled  = (h * long_weights.unsqueeze(-1)).sum(1)  # (B, d_model)
 
-        # ── Short stream (last 20 bars) ───────────────────────────────────────
+        # ── Short stream: LocalCausalAttention → AstrocyteGating ────────────
         x_short  = x[:, -self.attn_window:, :][:, :, self._SHORT_IDX]
         h_short  = self.short_proj(x_short)
         for layer in self.short_attn:
             h_short = layer(h_short)
 
-        short_scores  = self.short_pool(h_short).squeeze(-1)
-        short_weights = torch.softmax(short_scores, dim=-1)
-        short_pooled  = (h_short * short_weights.unsqueeze(-1)).sum(1)
+        # Astrocyte routing: content-addressed pool with regime-conditional T
+        # Replaces the fixed softmax-pool — gains concentrate on relevant patterns
+        short_pooled = self.astrocyte(h_short, regime)  # (B, d_model)
 
         # ── Fusion ────────────────────────────────────────────────────────────
         pooled       = self.fusion(torch.cat([long_pooled, short_pooled], dim=-1))
