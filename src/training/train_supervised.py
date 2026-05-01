@@ -64,17 +64,21 @@ class FocalLoss(nn.Module):
                 setting from the original paper; higher = more focus on hard.
     """
 
-    def __init__(self, weight: torch.Tensor | None = None, gamma: float = 2.0):
+    def __init__(self, weight: torch.Tensor | None = None, gamma: float = 2.0,
+                 label_smoothing: float = 0.0):
         super().__init__()
-        self.weight = weight
-        self.gamma  = gamma
+        self.weight          = weight
+        self.gamma           = gamma
+        self.label_smoothing = label_smoothing
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Standard CE loss per sample (reduction='none' to keep per-sample values)
-        ce = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
-        # p_t = probability assigned to the correct class
-        p_t = torch.exp(-ce)
-        # Focal weight: down-scale easy examples, leave hard ones intact
+        ce = F.cross_entropy(
+            logits, targets,
+            weight          = self.weight,
+            label_smoothing = self.label_smoothing,
+            reduction       = "none",
+        )
+        p_t          = torch.exp(-ce)
         focal_weight = (1.0 - p_t) ** self.gamma
         return (focal_weight * ce).mean()
 
@@ -202,12 +206,15 @@ def build_regime_balanced_sampler(
         cw = np.array(list(class_weights_cfg), dtype=np.float32)
         logger.info(f"Using config class weights: {cw}")
     else:
-        counts = np.bincount(labels, minlength=3).astype(np.float32)
-        raw_w  = 1.0 / np.sqrt(counts + 1)
-        raw_w  = raw_w / raw_w.min()
-        raw_w  = np.clip(raw_w, 1.0, 5.0)
-        cw     = raw_w / raw_w.sum() * 3
-        logger.info(f"Auto class weights: {cw}")
+        counts  = np.bincount(labels, minlength=3).astype(np.float32)
+        raw_w   = 1.0 / np.sqrt(counts + 1)
+        raw_w   = raw_w / raw_w.min()
+        # Buy class is 4.7× rarer than sell — boost buy weight to equalise exposure
+        buy_boost      = float(counts[0] / max(counts[2], 1))   # sell_n / buy_n
+        raw_w[2]      *= min(buy_boost, 10.0)                   # cap at 10×
+        raw_w          = np.clip(raw_w, 1.0, 50.0)
+        cw             = raw_w / raw_w.sum() * 3
+        logger.info(f"Auto class weights (buy boosted {buy_boost:.1f}×): {cw}")
 
     sample_weights = cw[labels].astype(np.float32)
     regime_mult    = np.ones(n, dtype=np.float32)
@@ -277,9 +284,10 @@ class Trainer:
         )
 
         # Fix 1: FocalLoss with class weights as alpha term.
-        w = torch.FloatTensor(class_weights).to(device) if class_weights is not None else None
-        gamma = float(cfg.training.get("focal_gamma", 2.0))
-        self.criterion            = FocalLoss(weight=w, gamma=gamma)
+        w              = torch.FloatTensor(class_weights).to(device) if class_weights is not None else None
+        gamma          = float(cfg.training.get("focal_gamma", 2.0))
+        label_smoothing = float(cfg.training.get("label_smoothing", 0.1))
+        self.criterion  = FocalLoss(weight=w, gamma=gamma, label_smoothing=label_smoothing)
         self.confidence_criterion = nn.MSELoss()
 
         self.best_signal_score = 0.0
@@ -711,6 +719,23 @@ def main(cfg: DictConfig) -> None:
     resume_path = cfg.training.get("resume_from", None)
     if resume_path and Path(resume_path).exists():
         trainer.load_checkpoint(resume_path)
+        # Reset LR to fresh start value after resume — LR was over-decayed
+        reset_lr = float(cfg.training.get("reset_lr", 0.0))
+        if reset_lr > 0:
+            for pg in trainer.optimizer.param_groups:
+                pg["lr"] = reset_lr
+            # Manual warmup: LinearLR for 5 epochs, then hand back to ReduceLROnPlateau.
+            # SequentialLR doesn't forward the metric arg to ReduceLROnPlateau.step(metric)
+            # so we manage the two schedulers manually via trainer._warmup_scheduler.
+            trainer._warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                trainer.optimizer,
+                start_factor = 0.1,
+                end_factor   = 1.0,
+                total_iters  = 5,
+            )
+            trainer._warmup_epochs = 5
+            trainer._warmup_done   = False
+            logger.info(f"LR reset to {reset_lr:.2e} with 5-epoch linear warmup")
     elif resume_path:
         logger.warning(f"resume_from={resume_path} not found — starting fresh")
 
@@ -723,7 +748,15 @@ def main(cfg: DictConfig) -> None:
         score   = Trainer.signal_score(pc)
 
         # Fix 3: ReduceLROnPlateau steps on signal_score after each epoch
-        trainer.scheduler.step(score)
+        # Warmup phase: step LinearLR; after warmup hand back to ReduceLROnPlateau
+        if getattr(trainer, "_warmup_done", True) is False:
+            trainer._warmup_scheduler.step()
+            trainer._warmup_epochs -= 1
+            if trainer._warmup_epochs <= 0:
+                trainer._warmup_done = True
+                logger.info("LR warmup complete — switching to ReduceLROnPlateau")
+        else:
+            trainer.scheduler.step(score)
 
         logger.info(
             f"Epoch {epoch}/{cfg.training.epochs} | "
