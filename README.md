@@ -1,6 +1,6 @@
 ## Underdevelopment 
 
-## Phase 5 Architecture (not finalised)
+## Phase 5 Architecture 
 
 Digram Sketch: v0.5.1-PriceBranchTransformer-ScatterPool
 <p align="center">
