@@ -14,7 +14,7 @@ Digram Sketch: v0.5.3.1-PriceBranchTransformer-ScatterPool-enriched
 ```
 Input (B, 240, 10)
     ↓
-LearnableScatteringBlock(J=3, Q=4)    ← KEEP: validated discriminative signal
+LearnableScatteringBlock(J=3, Q=4)
     → (B, 120, 104)
     ↓
 scatter_proj: Linear(104, 512)
@@ -23,14 +23,60 @@ scatter_proj: Linear(104, 512)
 TransformerEncoder(
     d_model=512, n_heads=8, ffn_dim=2048,
     n_layers=4, dropout=0.1,
-    is_causal=True                    ← causal mask, static shapes ✓
-)   → (B, 120, 512)
+    is_causal=True
+)
+    → (B, 120, 512)
     ↓
-Attention-weighted pool → (B, 512)
+Attention-weighted Pool
+    → z_main (B, 512)
 
-Short stream (wick_asym, vol_z): unchanged LocalCausalAttention(w=20)
+────────────────────────────────────────
+
+Short Stream (wick_asym, vol_z) (B, 240, 2)
     ↓
-Fusion: Linear(512+512, 512) → LayerNorm → GELU
+LocalCausalAttention(w=20)
+    → (B, 240, 512)
+    ↓
+Last-bar state extraction
+    → x_last (B, 512)
+
+    ↓
+    Regime detection (from sentiment tensor)
+        → regime ∈ {0,1,2,3}
+        → T_regime (learned, log-space)
+
+    ↓
+AstrocyteRoutingModule(K=16, conditioned on T_regime)
+    ├─ Pattern Memory ξ₁…ξ₁₆ ∈ ℝ^512
+    ├─ Pattern fitness:
+         fμ = ⟨x_last, ξμ⟩ / D
+    ├─ Gains:
+         pμ = softmax(fμ / T_regime)
+    ├─ Retrieval:
+         r = Σμ pμ ξμ
+    └─ Residual blend:
+         z_short = g · r + (1 − g) · x_last
+
+    → z_short (B, 512)
+
+────────────────────────────────────────
+
+Fusion
+    Concatenate z_main + z_short → (B, 1024)
+    ↓
+    Linear(1024 → 512)
+    ↓
+    LayerNorm
+    ↓
+    GELU
+    → z_fused (B, 512)
+    ↓
+Logits → (B, C)
+
+    ↓
+TemperatureScaling (post-hoc, scalar T)
+    ↓
+Calibrated Probabilities (B, C)
 ```
 
 ## Project Structure (not finalised)
