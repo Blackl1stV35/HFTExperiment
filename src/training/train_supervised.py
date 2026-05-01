@@ -711,16 +711,12 @@ def main(cfg: DictConfig) -> None:
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model: {n_params:,} params")
 
-    # torch.compile: re-enabled — memory confirmed stable at ~3GB with
-    # gradient checkpointing. Transformer has static shapes (T_s=120 fixed,
-    # causal mask pre-built as register_buffer) — Inductor can fuse correctly.
-    # Clear /tmp/torchinductor_root before first run to avoid stale kernels.
-    if hasattr(torch, "compile") and device.type == "cuda":
-        try:
-            model = torch.compile(model, mode="default")
-            logger.info("torch.compile enabled (Transformer static shapes)")
-        except Exception as e:
-            logger.warning(f"torch.compile skipped: {e}")
+    # torch.compile disabled permanently for this architecture.
+    # LocalCausalAttention(w=20) dispatches to _scaled_dot_product_flash_attention
+    # in compiled context which crashes: "invalid configuration argument" for T<64.
+    # Scattering block also has dynamic shapes blocking clean static tracing.
+    # Re-evaluate only after attn_window >= 64 or after removing scatter front-end.
+    logger.info("torch.compile skipped (flash_attn w=20 < 64 token minimum)")
 
     trainer = Trainer(cfg, model, device, class_weights=class_weights_arr)
 
