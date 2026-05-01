@@ -75,7 +75,7 @@ def main():
     parser.add_argument("--scaler",      default="window_minmax")
     parser.add_argument("--atr-period",  type=int, default=14)
     parser.add_argument("--atr-mult-tp", type=float, default=1.5)
-    parser.add_argument("--atr-mult-sl", type=float, default=1.5)   # was 0.75 — symmetric with tp
+    parser.add_argument("--atr-mult-sl", type=float, default=0.75)   # failed: ell:buy ratio = 4.60×  (was 4.76×, target ≈ 1.0-2.0×)
     parser.add_argument("--atr-min-tp",  type=float, default=150.0)
     parser.add_argument("--atr-max-tp",  type=float, default=800.0)
     parser.add_argument("--max-holding", type=int, default=40)
