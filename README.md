@@ -8,7 +8,7 @@ Digram Sketch: v0.5.3.1-PriceBranchTransformer-ScatterPool-enriched
 - Temperature Scaling: Initializing $T=1.5$ and using L-BFGS for post-training fit.
 
 <p align="center">
-  <img src="/assets/v0.5.1-PriceBranchTransformer-ScatterPool.png" alt="Phase 5 Architecture Diagram" style="max-width:100%; height:auto;"/>
+  <img src="assets\v0.5.3.1-PriceBranchTransformer-ScatterPool-enriched.png" alt="Phase 5.3 Architecture Diagram" style="max-width:100%; height:auto;"/>
 </p>
 
 ```
