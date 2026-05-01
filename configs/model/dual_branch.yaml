@@ -12,7 +12,7 @@ price:
   n_heads:    8
   ffn_dim:    2048        # 4 × d_model
   n_layers:   4
-  dropout:    0.1
+  dropout:    0.2   # was 0.1 — stronger regularisation for train/val gap
   attn_window: 20         # short-stream local attention
   # Scattering front-end (retained from Phase 4)
   scatter_J:  3
@@ -36,5 +36,5 @@ fusion:
 
 classifier:
   hidden_dims: [256, 128]
-  dropout: 0.4
+  dropout: 0.5   # was 0.4 — classifier head
   n_classes: 3

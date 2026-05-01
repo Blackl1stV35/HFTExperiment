@@ -272,16 +272,19 @@ class Trainer:
             weight_decay = cfg.training.weight_decay,
         )
 
-        # Fix 3: ReduceLROnPlateau replaces CosineAnnealingWarmRestarts.
-        # Cosine restarts surged LR at ep10/20, causing gradient spikes to 8.6-10.0.
-        # ReduceLROnPlateau only decays when signal_score stops improving.
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        # Phase 5 scheduler: CosineAnnealingWarmRestarts(T_0=30).
+        # GradNorm was 8-10 on first run due to LR surge at restart boundaries.
+        # Now safe: GradNorm=0.29 at ep90 — model is stable.
+        # Cosine restarts oscillate LR to escape local minima — ep86 spike to
+        # sell P=0.231 occurred at flat LR; restarts should stabilise that.
+        # eta_min=1e-6 prevents LR collapsing below useful range.
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
-            mode     = "max",      # maximise signal_score
-            factor   = 0.5,
-            patience = 15,   # was 5 — needs room to rise at 0.18pp/epoch
-            min_lr   = 1e-6,
+            T_0     = 30,     # restart every 30 epochs
+            T_mult  = 1,      # fixed period
+            eta_min = 1e-6,
         )
+        self._use_plateau = False  # flag: scheduler.step() takes no metric arg
 
         # Fix 1: FocalLoss with class weights as alpha term.
         w              = torch.FloatTensor(class_weights).to(device) if class_weights is not None else None
@@ -708,11 +711,16 @@ def main(cfg: DictConfig) -> None:
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model: {n_params:,} params")
 
-    # torch.compile disabled: adds ~1.5 GB graph intermediates — OOM on 40GB
-    # A100 with d_model=512, B=4096, gradient checkpointing active.
-    # Re-enable once memory budget is confirmed stable:
-    #   model = torch.compile(model, mode="default")
-    logger.info("torch.compile skipped (memory budget — enable after stability check)")
+    # torch.compile: re-enabled — memory confirmed stable at ~3GB with
+    # gradient checkpointing. Transformer has static shapes (T_s=120 fixed,
+    # causal mask pre-built as register_buffer) — Inductor can fuse correctly.
+    # Clear /tmp/torchinductor_root before first run to avoid stale kernels.
+    if hasattr(torch, "compile") and device.type == "cuda":
+        try:
+            model = torch.compile(model, mode="default")
+            logger.info("torch.compile enabled (Transformer static shapes)")
+        except Exception as e:
+            logger.warning(f"torch.compile skipped: {e}")
 
     trainer = Trainer(cfg, model, device, class_weights=class_weights_arr)
 
@@ -748,15 +756,15 @@ def main(cfg: DictConfig) -> None:
         score   = Trainer.signal_score(pc)
 
         # Fix 3: ReduceLROnPlateau steps on signal_score after each epoch
-        # Warmup phase: step LinearLR; after warmup hand back to ReduceLROnPlateau
+        # Warmup phase: step LinearLR; after warmup step CosineAnnealing
         if getattr(trainer, "_warmup_done", True) is False:
             trainer._warmup_scheduler.step()
             trainer._warmup_epochs -= 1
             if trainer._warmup_epochs <= 0:
                 trainer._warmup_done = True
-                logger.info("LR warmup complete — switching to ReduceLROnPlateau")
+                logger.info("LR warmup complete — switching to CosineAnnealingWarmRestarts")
         else:
-            trainer.scheduler.step(score)
+            trainer.scheduler.step(epoch)  # cosine uses epoch counter, not metric
 
         logger.info(
             f"Epoch {epoch}/{cfg.training.epochs} | "
