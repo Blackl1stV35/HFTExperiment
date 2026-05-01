@@ -13,7 +13,7 @@ training:
   epochs: 90
   batch_size: 4096          # A100 80 GB — 4× T4's 2048
   learning_rate: 5e-5
-  weight_decay: 0.05   # was 1e-5 — stronger L2 regularisation
+  weight_decay: 0.005   # was 1e-5 — stronger L2 regularisation
   early_stopping_patience: 30
   gradient_clip: 10.0
   focal_gamma: 1.0
