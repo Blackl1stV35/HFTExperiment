@@ -272,7 +272,7 @@ class Trainer:
             self.optimizer,
             mode     = "max",      # maximise signal_score
             factor   = 0.5,
-            patience = 5,
+            patience = 15,   # was 5 — needs room to rise at 0.18pp/epoch
             min_lr   = 1e-6,
         )
 
@@ -305,7 +305,7 @@ class Trainer:
         """
         sp = per_class["sell"]["precision"]
         sr = per_class["sell"]["recall"]
-        if sp < 0.30:
+        if sp < 0.05:    # was 0.30 — Transformer rises slowly from 0.04
             return 0.0
         def f1(p, r):
             return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
@@ -762,8 +762,12 @@ def main(cfg: DictConfig) -> None:
                 "val/buy_recall":      pc["buy"]["recall"],
             })
 
+        # Always save last — prevents losing progress if signal_score floor never crossed
+        val_m["signal_score"] = score
+        trainer.save_checkpoint(
+            f"{cfg.paths.model_dir}/{cfg.model.name}_last.pt", epoch, val_m
+        )
         if score > trainer.best_signal_score:
-            val_m["signal_score"] = score
             trainer.save_checkpoint(
                 f"{cfg.paths.model_dir}/{cfg.model.name}_best.pt", epoch, val_m
             )
