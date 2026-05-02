@@ -212,29 +212,24 @@ class AstrocyteGatingModule(nn.Module):
             1 = Bear + HIGH vol  ← current macro (sharp T=0.01)
             2 = Bull + LOW  vol
             3 = Bull + HIGH vol
+        Avoids data-dependent branching for Dynamo static-shape tracing:
+        always index log_T with a tensor, falling back to broadcast of index=1.
         """
         B, T, D = x.shape
-        residual = x[:, -1, :]  # use last bar as the query state
+        residual = x[:, -1, :]  # (B, d_model) last bar as query
 
-        # Pattern fitness: fμ(x) = (1/D) Σ_d x_last_d * pattern_μ_d  (linear overlap)
-        # Shape: (B, K)
-        fitness = torch.einsum("bd,kd->bk", residual, self.patterns) / D
+        # Pattern fitness — divide by fixed d_model scalar not dynamic D
+        fitness = torch.einsum("bd,kd->bk", residual, self.patterns) / self.d_model
 
-        # Regime-conditional temperature
-        if regime is not None:
-            T = torch.exp(self.log_T)[regime]          # (B,)
-            T = T.unsqueeze(-1)                         # (B, 1)
-        else:
-            T = torch.exp(self.log_T[1:2])             # default: Bear+HIGH
+        # Regime-conditional temperature — no Python if/else on tensor
+        # Default: repeat index 1 (Bear+HIGH) for the whole batch
+        if regime is None:
+            regime = torch.ones(B, dtype=torch.long, device=x.device)
+        T_vec = torch.exp(self.log_T)[regime].unsqueeze(-1)  # (B, 1) — static index op
 
-        # Astrocyte gains: softmax over fitness scores (the gain simplex fixed point)
-        gains = torch.softmax(fitness / T, dim=-1)     # (B, K)
-
-        # Retrieve: weighted sum of patterns
-        retrieved = torch.einsum("bk,kd->bd", gains, self.patterns)  # (B, d_model)
-
-        # Residual gate: blend retrieved with last-bar state
-        out = self.norm(residual + self.out_proj(retrieved))         # (B, d_model)
+        gains     = torch.softmax(fitness / T_vec, dim=-1)               # (B, K)
+        retrieved = torch.einsum("bk,kd->bd", gains, self.patterns)      # (B, d_model)
+        out       = self.norm(residual + self.out_proj(retrieved))        # (B, d_model)
         return out
 
 
