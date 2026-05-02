@@ -730,7 +730,11 @@ def main(cfg: DictConfig) -> None:
                 pg["lr"] = reset_lr
             # Reset epoch counter so full cfg.training.epochs run from here
             trainer.start_epoch = 1
-            logger.info("Epoch counter reset to 1 for full training cycle")
+            # Reset best score — prevents early stopping from firing against
+            # the loaded checkpoint's score on every resume cycle
+            trainer.best_signal_score = 0.0
+            trainer.patience_counter  = 0
+            logger.info("Epoch counter + best score reset for fresh cycle")
             # Manual warmup: LinearLR for 5 epochs, then hand back to ReduceLROnPlateau.
             # SequentialLR doesn't forward the metric arg to ReduceLROnPlateau.step(metric)
             # so we manage the two schedulers manually via trainer._warmup_scheduler.
