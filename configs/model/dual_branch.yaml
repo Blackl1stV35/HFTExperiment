@@ -12,7 +12,7 @@ price:
   n_heads:    8
   ffn_dim:    2048        # 4 × d_model
   n_layers:   4
-  dropout:    0.2   # was 0.1 — stronger regularisation for train/val gap
+  dropout:    0.1   # Run 2 setting — cosine runs overcorrected to 0.2
   attn_window: 20         # short-stream local attention
   # Scattering front-end (retained from Phase 4)
   scatter_J:  3

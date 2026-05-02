@@ -278,13 +278,17 @@ class Trainer:
         # Cosine restarts oscillate LR to escape local minima — ep86 spike to
         # sell P=0.231 occurred at flat LR; restarts should stabilise that.
         # eta_min=1e-6 prevents LR collapsing below useful range.
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        # ReduceLROnPlateau — Run 2 setting that achieved best test signal=0.207.
+        # Cosine restarts improved val loss but never beat Run 2 test signal.
+        # patience=15: gives model 15 epochs to improve signal_score before decay.
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
-            T_0     = 30,     # restart every 30 epochs
-            T_mult  = 1,      # fixed period
-            eta_min = 1e-6,
+            mode     = "max",
+            factor   = 0.5,
+            patience = 15,
+            min_lr   = 1e-6,
         )
-        self._use_plateau = False  # flag: scheduler.step() takes no metric arg
+        self._use_plateau = True
 
         # Fix 1: FocalLoss with class weights as alpha term.
         w              = torch.FloatTensor(class_weights).to(device) if class_weights is not None else None
@@ -759,15 +763,15 @@ def main(cfg: DictConfig) -> None:
         score   = Trainer.signal_score(pc)
 
         # Fix 3: ReduceLROnPlateau steps on signal_score after each epoch
-        # Warmup phase: step LinearLR; after warmup step CosineAnnealing
+        # Warmup phase: step LinearLR; after warmup hand to ReduceLROnPlateau
         if getattr(trainer, "_warmup_done", True) is False:
             trainer._warmup_scheduler.step()
             trainer._warmup_epochs -= 1
             if trainer._warmup_epochs <= 0:
                 trainer._warmup_done = True
-                logger.info("LR warmup complete — switching to CosineAnnealingWarmRestarts")
+                logger.info("LR warmup complete — switching to ReduceLROnPlateau")
         else:
-            trainer.scheduler.step(epoch)  # cosine uses epoch counter, not metric
+            trainer.scheduler.step(score)  # plateau uses signal_score metric
 
         logger.info(
             f"Epoch {epoch}/{cfg.training.epochs} | "

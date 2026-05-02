@@ -14,7 +14,7 @@ training:
   batch_size: 4096          # A100 80 GB — 4× T4's 2048
   learning_rate: 5e-5
   weight_decay: 0.005   # was 0.05 — overcorrected
-  early_stopping_patience: 30
+  early_stopping_patience: 50   # was 30 — must exceed T_0 to allow restart recovery
   gradient_clip: 10.0
   focal_gamma: 1.0
   mixed_precision: true     # bf16 on A100 — free ~20% throughput
