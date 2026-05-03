@@ -212,24 +212,25 @@ def download_from_yfinance(symbol, days, timeframe="D1", resume_from=None):
 
     hist = hist.reset_index()
     ts_col = "Datetime" if "Datetime" in hist.columns else "Date"
-    # Remove timezone if present
-    try:
-        hist[ts_col] = hist[ts_col].dt.tz_localize(None)
-    except Exception:
-        try:
-            hist[ts_col] = hist[ts_col].dt.tz_convert(None)
-        except Exception:
-            pass
+
+    # Strip timezone unconditionally at numpy level — avoids Polars Object dtype.
+    # datetime64[ns, tz] → view as int64 ns → pl.from_epoch gives tz-naive Datetime.
+    import numpy as np
+    raw_ts = hist[ts_col].values
+    # astype("datetime64[ns]") drops tz info on all pandas versions
+    ts_ns  = raw_ts.astype("datetime64[ns]").view("int64")
 
     df = pl.DataFrame({
-        "timestamp":   list(hist[ts_col].values),
+        "timestamp":   ts_ns.tolist(),
         "open":        hist["Open"].astype(float).tolist(),
         "high":        hist["High"].astype(float).tolist(),
         "low":         hist["Low"].astype(float).tolist(),
         "close":       hist["Close"].astype(float).tolist(),
         "tick_volume": hist["Volume"].fillna(0).astype(int).tolist(),
         "spread":      [20] * len(hist),
-    }).with_columns(pl.col("timestamp").cast(pl.Datetime))
+    }).with_columns(
+        pl.from_epoch(pl.col("timestamp"), time_unit="ns").alias("timestamp")
+    )
 
     # Drop weekends
     df = df.filter(pl.col("timestamp").dt.weekday().is_in([0,1,2,3,4]))
