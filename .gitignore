@@ -14,6 +14,7 @@ data/*.npy
 data/*.npz
 data/sentiment_cache/
 data/ft_cache/
+data/*.parquet
 models/*.pt
 models/*.onnx
 exports/
