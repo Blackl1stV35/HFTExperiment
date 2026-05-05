@@ -10,7 +10,7 @@ project:
   device: auto
 
 training:
-  epochs: 90
+  epochs: 120   # extended: Run 7 not converged at ep90, LR still 2.5e-5
   batch_size: 4096          # A100 80 GB — 4× T4's 2048
   learning_rate: 5e-5
   weight_decay: 0.005   # was 0.05 — overcorrected
