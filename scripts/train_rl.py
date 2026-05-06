@@ -25,7 +25,7 @@ Retained from v2:
     - GMM2 Bear entry gate, G/S max_hold
     - Drive mirroring
 
-Observation (13-dim, unchanged):
+Observation (15-dim: +ret_1h obs[13], +ret_15m obs[14]):
     [sell, hold, buy, conf, pos_dir, unreal, hold_t,
      atr_norm, trend_norm, session_phase,
      regime_quality, gs_quartile, cu_au_regime]
@@ -312,7 +312,7 @@ class FrozenEncoderEnv(gym.Env):
         truncated  = self.balance <= 0
         if terminated or truncated:
             if self.position_dir != 0: reward += self._close_position(voluntary=False)
-        obs = self._get_obs() if not (terminated or truncated) else np.zeros(13, np.float32)
+        obs = self._get_obs() if not (terminated or truncated) else np.zeros(15, np.float32)
         return obs, reward, terminated, truncated, {
             "balance": self.balance, "episode_pnl": self.episode_pnl,
             "n_trades": self.n_trades, "n_wins": self.n_wins,
