@@ -160,6 +160,8 @@ class FrozenEncoderEnv(gym.Env):
         gs_quartile:    np.ndarray | None = None,
         cu_au_regime:   np.ndarray | None = None,
         gmm2_state:     np.ndarray | None = None,
+        ret_1h:         np.ndarray | None = None,   # Phase 6: 60-bar log-return z-score
+        ret_15m:        np.ndarray | None = None,   # Phase 6: 15-bar log-return z-score
         max_hold:              int   = 80,
         episode_len:           int   = 8000,
         confidence_gate:       float = 0.70,
@@ -187,6 +189,14 @@ class FrozenEncoderEnv(gym.Env):
         self.gs_quartile    = _arr(gs_quartile,     lambda n: np.zeros(n, np.float32))
         self.cu_au_regime   = _arr(cu_au_regime,    lambda n: np.full(n, 0.5, np.float32))
         self.gmm2_state     = _arr(gmm2_state,      lambda n: np.ones(n, np.float32))
+        # Phase 6 RL additions (validated by Phase 6 report, §10):
+        # ret_1h  — 60-bar cumulative log-return z-scored. KS=0.361 (strongest of all candidates),
+        #           late-window concentration (SellD[20]=0.605), regime-sensitive (D=0.219).
+        # ret_15m — 15-bar cumulative log-return z-scored. KS=0.206, regime-sensitive (D=0.103).
+        # Both fail supervised redundancy (Transformer already computes equivalent implicitly)
+        # but RL agent operates on obs vector — no access to Transformer internals.
+        self.ret_1h         = _arr(ret_1h,         lambda n: np.zeros(n, np.float32))
+        self.ret_15m        = _arr(ret_15m,        lambda n: np.zeros(n, np.float32))
 
         self._max_hold_default = max_hold
         self.episode_len       = min(episode_len, n - 1)
@@ -200,7 +210,7 @@ class FrozenEncoderEnv(gym.Env):
         self.early_cut_bonus_frac   = early_cut_bonus_frac
         self.exit_threshold: float  = 0.0
 
-        self.observation_space = spaces.Box(-np.inf, np.inf, (13,), np.float32)
+        self.observation_space = spaces.Box(-np.inf, np.inf, (15,), np.float32)  # +ret_1h, +ret_15m
         self.action_space      = spaces.Box(-1.0, 1.0, (2,), np.float32)
         self._offset = 0
         self._reset_state()
@@ -245,10 +255,11 @@ class FrozenEncoderEnv(gym.Env):
         unreal = np.clip(self._unrealized_usd()/100.0, -5.0, 5.0) if self.position_dir else 0.0
         hold_frac = min(self.hold_time / max(self.max_hold, 1), 1.0)
         return np.array([
-            sig[0], sig[1], sig[2], conf,
-            float(self.position_dir), unreal, hold_frac,
-            self.atr_norm[gi], self.trend_norm[gi], self.session_phase[gi],
-            self.regime_quality[gi], self.gs_quartile[gi], self.cu_au_regime[gi],
+            sig[0], sig[1], sig[2], conf,                                   # 0-3
+            float(self.position_dir), unreal, hold_frac,                    # 4-6
+            self.atr_norm[gi], self.trend_norm[gi], self.session_phase[gi], # 7-9
+            self.regime_quality[gi], self.gs_quartile[gi], self.cu_au_regime[gi],  # 10-12
+            self.ret_1h[gi], self.ret_15m[gi],                              # 13-14 (Phase 6)
         ], dtype=np.float32)
 
     def _close_position(self, voluntary=False):
@@ -446,6 +457,32 @@ def main():
     except Exception: seq_ts = None
 
     atr_norm, trend_norm, session_phase = compute_rl_obs_features(seq_prices, seq_ts)
+
+    # ── Phase 6 RL additions: ret_1h and ret_15m ─────────────────────────────
+    # Computed from seq_prices — no NPZ rebuild required.
+    # Phase 6 report §10: both fail supervised redundancy (Transformer computes
+    # equivalent implicitly) but RL agent operates on obs vector directly and
+    # has no access to Transformer internals. ret_1h has KS=0.361 (project best),
+    # regime-sensitive (D=0.219). ret_15m KS=0.206, regime-sensitive (D=0.103).
+    def _mtf_return_zscored(prices: np.ndarray, window: int) -> np.ndarray:
+        """Cumulative log-return over `window` bars, 120-bar rolling z-score, tanh-clipped."""
+        log_ret = np.concatenate([[0.0], np.log(prices[1:] / (prices[:-1] + 1e-8))])
+        rolling = np.convolve(log_ret, np.ones(window), mode='same')
+        out     = np.empty(len(rolling), dtype=np.float32)
+        W       = 120
+        for i in range(len(rolling)):
+            lo_w = max(0, i - W + 1)
+            win  = rolling[lo_w:i + 1]
+            mu, sig = win.mean(), win.std()
+            out[i] = float(np.tanh((rolling[i] - mu) / (sig + 1e-8)))
+        return out
+
+    logger.info("Computing ret_1h and ret_15m for RL obs extension...")
+    ret_1h_arr  = _mtf_return_zscored(seq_prices, window=60)
+    ret_15m_arr = _mtf_return_zscored(seq_prices, window=15)
+    logger.info(f"ret_1h: mean={ret_1h_arr.mean():.4f} std={ret_1h_arr.std():.4f}")
+    logger.info(f"ret_15m: mean={ret_15m_arr.mean():.4f} std={ret_15m_arr.std():.4f}")
+
     split = int(len(signals) * 0.8)
     logger.info(f"Train={split:,} Eval={len(signals)-split:,}")
 
@@ -461,6 +498,7 @@ def main():
             trend_norm=trend_norm[lo:hi], session_phase=session_phase[lo:hi],
             regime_quality=seq_rq[lo:hi], gs_quartile=seq_gs[lo:hi],
             cu_au_regime=seq_cu[lo:hi], gmm2_state=seq_gmm2[lo:hi],
+            ret_1h=ret_1h_arr[lo:hi], ret_15m=ret_15m_arr[lo:hi],
             max_hold=args.max_hold, episode_len=args.episode_len,
             confidence_gate=args.confidence_gate,
             commission_usd=comm, spread_pips=sp,
@@ -472,7 +510,7 @@ def main():
     eval_env  = make_env(split, len(signals), args.commission, args.spread_pips)
 
     agent = ConfidenceSACAgent(
-        obs_dim=13, hidden_dims=[512, 512],
+        obs_dim=15, hidden_dims=[512, 512],  # +ret_1h, +ret_15m
         device=str(device), curriculum_warmup_steps=args.curriculum_warmup,
         buffer_capacity=2_000_000, batch_size=2048,
     )
