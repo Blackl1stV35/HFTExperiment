@@ -27,6 +27,7 @@ Output file layout (all arrays aligned, window_size already trimmed):
     atr_norm        (N,)     float32  — RL obs feature 7
     trend_norm      (N,)     float32  — RL obs feature 8
     session_phase   (N,)     float32  — RL obs feature 9
+    tick_volume_raw (N,)     int32    — raw bar tick count (for VIO / inventory_pressure)
     metadata        scalar   — JSON string with config snapshot
 
 N = len(bars) - window_size  (sequences aligned with seq_len context)
@@ -75,7 +76,7 @@ def main():
     parser.add_argument("--scaler",      default="window_minmax")
     parser.add_argument("--atr-period",  type=int, default=14)
     parser.add_argument("--atr-mult-tp", type=float, default=1.5)
-    parser.add_argument("--atr-mult-sl", type=float, default=0.75)   # failed: sell:buy ratio = 4.60×  (was 4.76×, target ≈ 1.0-2.0×)
+    parser.add_argument("--atr-mult-sl", type=float, default=0.75)  # kept asymmetric — Bear regime bias dominates
     parser.add_argument("--atr-min-tp",  type=float, default=150.0)
     parser.add_argument("--atr-max-tp",  type=float, default=800.0)
     parser.add_argument("--max-holding", type=int, default=40)
@@ -147,7 +148,24 @@ def main():
     import polars as pl
     import pandas as pd
     df_wd = df.filter(pl.col("timestamp").dt.weekday().is_in([1, 2, 3, 4, 5]))
-    assert len(df_wd) == len(features) + ws,         f"Weekday df length {len(df_wd)} != features {len(features)+ws}"
+    assert len(df_wd) == len(features) + ws, \
+        f"Weekday df length {len(df_wd)} != features {len(features)+ws}"
+
+    # ── 5b. tick_volume_raw for inventory_pressure VIO (Phase 7/8) ────────────
+    # Raw unscaled bar tick count. VIO = Σ(V×sign) / Σ(V) requires absolute
+    # magnitudes — MinMax or tanh scaling destroys the normalisation property.
+    logger.info("Extracting tick_volume_raw...")
+    if "tick_volume" in df_wd.columns:
+        tv_full = df_wd["tick_volume"].to_numpy().astype(np.int32)
+        tick_volume_raw = tv_full[ws:]
+        assert len(tick_volume_raw) == n, \
+            f"tick_volume_raw {len(tick_volume_raw)} != n {n}"
+        logger.info(f"  tick_volume_raw: min={tick_volume_raw.min()} "
+                    f"max={tick_volume_raw.max()} mean={tick_volume_raw.mean():.1f}")
+    else:
+        tick_volume_raw = np.zeros(n, dtype=np.int32)
+        logger.warning("No tick_volume column — tick_volume_raw=zeros. "
+                       "inventory_pressure VIO will not be computable.")
 
     # ── 6. Regime arrays (from weekday-filtered df) ──────────────────────────
     logger.info("Extracting regime arrays...")
@@ -230,8 +248,9 @@ def main():
         rq            = rq.astype(np.float32),
         atr_norm      = atr_norm.astype(np.float32),
         trend_norm    = trend_norm.astype(np.float32),
-        session_phase = session_phase.astype(np.float32),
-        metadata      = np.array(metadata),
+        session_phase   = session_phase.astype(np.float32),
+        tick_volume_raw = tick_volume_raw,          # int32 raw bar tick count
+        metadata        = np.array(metadata),
     )
 
     size_mb = out_path.stat().st_size / 1024**2
@@ -256,3 +275,60 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ── Phase 6 bypass features ───────────────────────────────────────────────────
+# Run phase6_feature_exploration.ipynb first to validate KS/MI/redundancy.
+# Pass validated feature names via --bypass-features flag.
+
+def compute_bypass_features(close, high, low, timestamps_ns, bypass_list, dxy_parquet=None):
+    """Compute and RobustScale validated Phase 6 bypass features.
+
+    Returns ndarray (N, len(bypass_list)) float32.
+    """
+    import numpy as np
+    from sklearn.preprocessing import RobustScaler
+
+    def _wilder_atr(h, l, c, p=14):
+        n  = len(c)
+        tr = np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))
+        tr = np.concatenate([[tr[0]], tr])
+        atr = np.empty(n); atr[0] = tr[0]; a = 1.0/p
+        for i in range(1, n): atr[i] = atr[i-1]*(1-a)+tr[i]*a
+        return atr
+
+    def _rolling_zscore(arr, w=120, eps=1e-8):
+        arr = arr.astype(np.float64); n = len(arr); out = np.empty(n, np.float32)
+        for i in range(n):
+            win = arr[max(0, i-w+1):i+1]; out[i] = float(np.tanh((arr[i]-win.mean())/(win.std()+eps)))
+        return out
+
+    def _mtf_return(c, window):
+        lr = np.concatenate([[0.0], np.log(c[1:]/(c[:-1]+1e-8))])
+        return _rolling_zscore(np.convolve(lr, np.ones(window), mode='same'))
+
+    out = []
+    for name in bypass_list:
+        if name == 'vwap_dev_norm':
+            tp   = (high+low+close)/3.0
+            vwap = np.cumsum(tp)/np.arange(1, len(tp)+1)
+            atr  = _wilder_atr(high, low, close)
+            feat = np.tanh((close-vwap)/(atr+1e-8)).astype(np.float32)
+        elif name in ('ret_5m', 'ret_15m', 'ret_1h'):
+            feat = _mtf_return(close, {'ret_5m':5,'ret_15m':15,'ret_1h':60}[name])
+        elif name == 'dxy_return_20':
+            import polars as pl
+            dxy  = pl.read_parquet(dxy_parquet)
+            dc   = dxy['close'].to_numpy().astype(np.float64)
+            dt   = dxy['timestamp'].cast(pl.Datetime).to_numpy().astype(np.int64)
+            idx  = np.clip(np.searchsorted(dt, timestamps_ns.astype(np.int64), side='right')-1, 0, len(dc)-1)
+            lr   = np.concatenate([[0.0], np.log(dc[idx][1:]/(dc[idx][:-1]+1e-8))])
+            feat = _rolling_zscore(np.convolve(lr, np.ones(20)/20.0, mode='same'))
+        else:
+            raise ValueError(f"Unknown bypass feature: {name}")
+        out.append(feat.reshape(-1))
+
+    if not out:
+        return np.zeros((len(close), 0), dtype=np.float32)
+    arr = np.stack(out, axis=1).astype(np.float32)
+    return RobustScaler().fit_transform(arr).astype(np.float32)
