@@ -577,14 +577,14 @@ def main():
             return sd
 
         obs_dim = 16
-        actor_sd  = _pad_state_dict(rl_ckpt["actor"],  obs_dim)
-        critic1_sd = _pad_state_dict(rl_ckpt["critic1"], obs_dim + 2)
-        critic2_sd = _pad_state_dict(rl_ckpt["critic2"], obs_dim + 2)
+        actor_sd   = _pad_state_dict(rl_ckpt["actor"], obs_dim)
+        q1_sd      = _pad_state_dict(rl_ckpt["q1"],    obs_dim + 2)
+        q2_sd      = _pad_state_dict(rl_ckpt["q2"],    obs_dim + 2)
         agent.actor.load_state_dict(actor_sd)
-        agent.critic1.load_state_dict(critic1_sd)
-        agent.critic2.load_state_dict(critic2_sd)
-        agent.target_critic1.load_state_dict(critic1_sd)
-        agent.target_critic2.load_state_dict(critic2_sd)
+        agent.q1.load_state_dict(q1_sd)
+        agent.q2.load_state_dict(q2_sd)
+        agent.q1_target.load_state_dict(q1_sd)
+        agent.q2_target.load_state_dict(q2_sd)
         logger.info("  Agent weights loaded with zero-padded obs dim (replay buffer reset)")
     mode_str = "flat-cost hardening" if args.flat_costs else f"cost curriculum n_evolves={args.n_evolves}"
     logger.info(
