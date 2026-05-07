@@ -162,6 +162,7 @@ class FrozenEncoderEnv(gym.Env):
         gmm2_state:     np.ndarray | None = None,
         ret_1h:         np.ndarray | None = None,   # Phase 6: 60-bar log-return z-score
         ret_15m:        np.ndarray | None = None,   # Phase 6: 15-bar log-return z-score
+        inv_pressure:   np.ndarray | None = None,   # Phase 8: inventory_pressure_vio (obs[15])
         max_hold:              int   = 80,
         episode_len:           int   = 8000,
         confidence_gate:       float = 0.70,
@@ -197,6 +198,11 @@ class FrozenEncoderEnv(gym.Env):
         # but RL agent operates on obs vector — no access to Transformer internals.
         self.ret_1h         = _arr(ret_1h,         lambda n: np.zeros(n, np.float32))
         self.ret_15m        = _arr(ret_15m,        lambda n: np.zeros(n, np.float32))
+        # Phase 8: inventory_pressure_vio — VIO formula, MI=1.92x OHLCV mean.
+        # Redundancy ratio=2.62 vs spread_pressure fails supervised threshold,
+        # but RL policy never sees spread_pressure directly — only frozen encoder
+        # output probs. VIO provides direct inventory-imbalance signal.
+        self.inv_pressure   = _arr(inv_pressure,   lambda n: np.zeros(n, np.float32))
 
         self._max_hold_default = max_hold
         self.episode_len       = min(episode_len, n - 1)
@@ -210,7 +216,7 @@ class FrozenEncoderEnv(gym.Env):
         self.early_cut_bonus_frac   = early_cut_bonus_frac
         self.exit_threshold: float  = 0.0
 
-        self.observation_space = spaces.Box(-np.inf, np.inf, (15,), np.float32)  # +ret_1h, +ret_15m
+        self.observation_space = spaces.Box(-np.inf, np.inf, (16,), np.float32)  # +ret_1h, +ret_15m, +inv_pressure
         self.action_space      = spaces.Box(-1.0, 1.0, (2,), np.float32)
         self._offset = 0
         self._reset_state()
@@ -260,6 +266,7 @@ class FrozenEncoderEnv(gym.Env):
             self.atr_norm[gi], self.trend_norm[gi], self.session_phase[gi], # 7-9
             self.regime_quality[gi], self.gs_quartile[gi], self.cu_au_regime[gi],  # 10-12
             self.ret_1h[gi], self.ret_15m[gi],                              # 13-14 (Phase 6)
+            self.inv_pressure[gi],                                          # 15    (Phase 8)
         ], dtype=np.float32)
 
     def _close_position(self, voluntary=False):
@@ -312,7 +319,7 @@ class FrozenEncoderEnv(gym.Env):
         truncated  = self.balance <= 0
         if terminated or truncated:
             if self.position_dir != 0: reward += self._close_position(voluntary=False)
-        obs = self._get_obs() if not (terminated or truncated) else np.zeros(15, np.float32)
+        obs = self._get_obs() if not (terminated or truncated) else np.zeros(16, np.float32)
         return obs, reward, terminated, truncated, {
             "balance": self.balance, "episode_pnl": self.episode_pnl,
             "n_trades": self.n_trades, "n_wins": self.n_wins,
@@ -395,6 +402,11 @@ def main():
     parser.add_argument("--curriculum-warmup",type=int,  default=100_000)
     parser.add_argument("--batch-size",       type=int,  default=8192)  # A100
     parser.add_argument("--regime-csv",       default="data/regime/daily_regime_labels.csv")
+    # Option B: extended flat-cost hardening
+    parser.add_argument("--resume-agent",     default=None,
+                        help="Path to existing SAC checkpoint (.pt) to resume from")
+    parser.add_argument("--flat-costs",       action="store_true",
+                        help="Disable curriculum — run all steps at full --commission/--spread-pips")
     args = parser.parse_args()
 
     setup_logger(); set_seed(args.seed)
@@ -483,6 +495,28 @@ def main():
     logger.info(f"ret_1h: mean={ret_1h_arr.mean():.4f} std={ret_1h_arr.std():.4f}")
     logger.info(f"ret_15m: mean={ret_15m_arr.mean():.4f} std={ret_15m_arr.std():.4f}")
 
+    # ── Phase 8: inventory_pressure_vio ──────────────────────────────────────
+    # VIO[t] = Σ(V_k × sign_k) / Σ(V_k)  over rolling W=20 bars
+    # Phase 8 results: KS=0.112, MI=0.01076 (1.92x OHLCV mean), Red=2.62 (RL safe).
+    # tick_volume_raw from NPZ if available; falls back to uniform volume (VIO→mean direction).
+    logger.info("Computing inventory_pressure_vio (Phase 8 obs[15])...")
+    W_vio = 20
+    try:
+        tick_vol = _d["tick_volume_raw"].astype(np.float64)
+        logger.info("tick_volume_raw found in NPZ — using true VIO")
+    except Exception:
+        tick_vol = np.ones(len(seq_prices), dtype=np.float64)
+        tick_vol = np.ones(len(seq_prices), dtype=np.float64)
+        logger.warning("tick_volume_raw not in NPZ — using uniform volume (VIO≈mean direction)")
+    bar_dir = np.sign(seq_prices - np.concatenate([[seq_prices[0]], seq_prices[:-1]])).astype(np.float64)
+    inv_pressure_arr = np.empty(len(seq_prices), dtype=np.float32)
+    for i in range(len(seq_prices)):
+        lo  = max(0, i - W_vio + 1)
+        num = np.sum(tick_vol[lo:i+1] * bar_dir[lo:i+1])
+        den = np.sum(tick_vol[lo:i+1]) + 1e-8
+        inv_pressure_arr[i] = float(num / den)
+    logger.info(f"inv_pressure: mean={inv_pressure_arr.mean():.4f} std={inv_pressure_arr.std():.4f}")
+
     split = int(len(signals) * 0.8)
     logger.info(f"Train={split:,} Eval={len(signals)-split:,}")
 
@@ -490,8 +524,16 @@ def main():
         n_evolves=args.n_evolves, total_steps=args.steps,
         final_commission=args.commission, final_spread=args.spread_pips,
     )
+    if args.flat_costs:
+        # Option B: skip curriculum — start at full costs immediately
+        logger.info(f"--flat-costs: curriculum disabled. "
+                    f"Fixed comm=${args.commission} spread={args.spread_pips}pip from step 1")
+        args.n_evolves = 1   # save one checkpoint at end
 
     def make_env(lo, hi, comm=0.0, sp=0.0):
+        # flat-costs: always use full costs for train env too
+        if args.flat_costs:
+            comm = args.commission; sp = args.spread_pips
         return FrozenEncoderEnv(
             signals=signals[lo:hi], confidences=confidences[lo:hi],
             prices=seq_prices[lo:hi], atr_norm=atr_norm[lo:hi],
@@ -499,6 +541,7 @@ def main():
             regime_quality=seq_rq[lo:hi], gs_quartile=seq_gs[lo:hi],
             cu_au_regime=seq_cu[lo:hi], gmm2_state=seq_gmm2[lo:hi],
             ret_1h=ret_1h_arr[lo:hi], ret_15m=ret_15m_arr[lo:hi],
+            inv_pressure=inv_pressure_arr[lo:hi],
             max_hold=args.max_hold, episode_len=args.episode_len,
             confidence_gate=args.confidence_gate,
             commission_usd=comm, spread_pips=sp,
@@ -510,14 +553,23 @@ def main():
     eval_env  = make_env(split, len(signals), args.commission, args.spread_pips)
 
     agent = ConfidenceSACAgent(
-        obs_dim=15, hidden_dims=[512, 512],  # +ret_1h, +ret_15m
+        obs_dim=16, hidden_dims=[512, 512],  # +ret_1h, +ret_15m, +inv_pressure
         device=str(device), curriculum_warmup_steps=args.curriculum_warmup,
         buffer_capacity=2_000_000, batch_size=2048,
     )
+    if args.resume_agent:
+        logger.info(f"Option B: resuming agent from {args.resume_agent}")
+        rl_ckpt = torch.load(args.resume_agent, map_location=device)
+        agent.actor.load_state_dict(rl_ckpt["actor"])
+        agent.critic1.load_state_dict(rl_ckpt["critic1"])
+        agent.critic2.load_state_dict(rl_ckpt["critic2"])
+        agent.target_critic1.load_state_dict(rl_ckpt["critic1"])
+        agent.target_critic2.load_state_dict(rl_ckpt["critic2"])
+        logger.info("  Agent weights loaded (replay buffer reset — flat-cost hardening)")
+    mode_str = "flat-cost hardening" if args.flat_costs else f"cost curriculum n_evolves={args.n_evolves}"
     logger.info(
-        f"Phase 3 RL v2: cost curriculum n_evolves={args.n_evolves}\n"
-        f"  commission: 0 → ${args.commission} over {args.steps:,} steps\n"
-        f"  spread: 0 → {args.spread_pips} pips over {args.steps:,} steps\n"
+        f"RL Phase 5: {mode_str}\n"
+        f"  commission: ${args.commission}  spread: {args.spread_pips}pips\n"
         f"  episode_len={args.episode_len} | confidence_gate={args.confidence_gate}"
     )
 
