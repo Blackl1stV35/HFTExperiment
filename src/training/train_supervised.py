@@ -192,13 +192,19 @@ def build_regime_balanced_sampler(
     timestamps,
     class_weights_cfg = None,
     epoch_size:        int = 500_000,
+    vol_enc:           np.ndarray | None = None,   # Phase B: Bear+HIGH oversampling
+    bear_high_mult:    float = 3.5,                # Phase B: multiplier for Bear+HIGH seqs
 ) -> tuple[WeightedRandomSampler, np.ndarray]:
     """WeightedRandomSampler: per-sample weight = class_weight x regime_mult.
 
     Regime multipliers:
-        Bear (gmm2=0):  x2.0
+        Bear+HIGH (gmm2=0, vol_enc≥0.67):  x{bear_high_mult} — Phase B addition
+            Sell labels concentrate in Bear+HIGH (Phase 6 regime-conditional KS=0.219
+            for ret_1h; Bear+HIGH sequences are structurally under-represented).
+            Oversampling forces the model to specialise on the regime where sell
+            precision matters most without changing architecture or NPZ.
+        Bear (gmm2=0, not HIGH):  x2.0
         pre-2020 bars:  x1.5 — boost historical diversity
-        (post-2024 x0.5 removed — test set IS post-2024 data)
     """
     n = len(labels)
 
@@ -220,14 +226,36 @@ def build_regime_balanced_sampler(
     regime_mult    = np.ones(n, dtype=np.float32)
 
     if gmm2 is not None and len(gmm2) == n:
-        regime_mult[gmm2 == 0] = 2.0
+        bear_mask = gmm2 == 0
+        # ── Phase B: Bear+HIGH oversampling ──────────────────────────────────
+        # vol_enc encodes vol regime: 0.0=LOW 0.5=NORMAL 1.0=HIGH (float32).
+        # HIGH threshold = 0.67 (midpoint between NORMAL and HIGH endpoints).
+        # Bear+HIGH gets bear_high_mult; remaining Bear sequences get x2.0.
+        if vol_enc is not None and len(vol_enc) == n:
+            high_mask       = vol_enc >= 0.67
+            bear_high_mask  = bear_mask & high_mask
+            bear_only_mask  = bear_mask & ~high_mask
+            regime_mult[bear_only_mask] = 2.0
+            regime_mult[bear_high_mask] = bear_high_mult
+            n_bear_high = bear_high_mask.sum()
+            n_bear_only = bear_only_mask.sum()
+            n_sell_bh   = ((labels == 0) & bear_high_mask).sum()
+            logger.info(
+                f"Bear+HIGH oversampling x{bear_high_mult:.1f}: "
+                f"n={n_bear_high:,} seqs ({100*n_bear_high/n:.1f}%) | "
+                f"sell in Bear+HIGH={n_sell_bh:,} "
+                f"({100*n_sell_bh/max((labels==0).sum(),1):.1f}% of all sell labels)"
+            )
+            logger.info(f"Bear-only x2.0: n={n_bear_only:,} seqs")
+        else:
+            # Fallback if vol_enc unavailable — original Bear x2.0 only
+            regime_mult[bear_mask] = 2.0
+            logger.warning("vol_enc not available — Bear+HIGH mult skipped, using Bear x2.0")
 
     if timestamps is not None and len(timestamps) == n:
         import pandas as pd
         ts      = pd.to_datetime(timestamps)
         cutoff  = pd.Timestamp("2020-01-01")
-        # np.asarray works on DatetimeIndex, Series, and numpy datetime64
-        # arrays without calling .to_numpy() on the boolean result.
         pre2020 = np.asarray(ts < cutoff, dtype=bool)
         regime_mult[pre2020] *= 1.5
         logger.info(f"Temporal reweighting: pre-2020={pre2020.sum():,} x1.5")
@@ -240,7 +268,7 @@ def build_regime_balanced_sampler(
         replacement = True,
     )
     logger.info(
-        f"RegimeBalancedSampler: Bear x2.0 | "
+        f"RegimeBalancedSampler: Bear+HIGH x{bear_high_mult:.1f} | Bear x2.0 | "
         f"class weights sell={cw[0]:.2f} hold={cw[1]:.2f} buy={cw[2]:.2f} | "
         f"epoch_size={actual_epoch_size:,}"
     )
@@ -630,6 +658,7 @@ def main(cfg: DictConfig) -> None:
     seq_labels = labels[seq_len - 1 : seq_len - 1 + n_total]
     y_train    = seq_labels[train_idx]
     gmm2_train = gmm2_seq[train_idx] if gmm2_seq is not None else None
+    vol_train  = vol_seq[train_idx]  if vol_seq  is not None else None  # Phase B
     ts_train   = np.array(ts_seq)[train_idx] if ts_seq is not None else None
 
     logger.info(
@@ -656,6 +685,8 @@ def main(cfg: DictConfig) -> None:
         timestamps        = ts_train,
         class_weights_cfg = cw_cfg,
         epoch_size        = epoch_size,
+        vol_enc           = vol_train,      # Phase B: Bear+HIGH x3.5 oversampling
+        bear_high_mult    = 3.5,
     )
     # Extract per-sample weights from the sampler for torch.multinomial
     _ds_tmp = SequenceDataset(features, labels, seq_len)
@@ -664,11 +695,21 @@ def main(cfg: DictConfig) -> None:
     _raw_labels = labels[train_idx + seq_len - 1]
     _cw = class_weights_arr if class_weights_arr is not None else np.ones(3)
     _sample_w = _cw[_raw_labels].astype(np.float32)
-    # Regime multiplier: Bear × 2.0, pre-2020 × 1.5
+    # Regime multiplier: Bear+HIGH x3.5, Bear-only x2.0, pre-2020 x1.5 (Phase B)
     _regime_mult = np.ones(len(train_idx), dtype=np.float32)
     if gmm2_train is not None:
-        # gmm2_train is already aligned to train_idx — no secondary indexing needed
-        _regime_mult[gmm2_train < 0.5] *= 2.0
+        bear_mask_gpu = gmm2_train < 0.5
+        if vol_train is not None:
+            high_mask_gpu      = vol_train >= 0.67
+            _regime_mult[bear_mask_gpu & high_mask_gpu]  = 3.5   # Bear+HIGH
+            _regime_mult[bear_mask_gpu & ~high_mask_gpu] = 2.0   # Bear-only
+        else:
+            _regime_mult[bear_mask_gpu] = 2.0
+    if ts_train is not None:
+        import pandas as pd
+        _ts = pd.to_datetime(ts_train)
+        _pre2020 = np.asarray(_ts < pd.Timestamp("2020-01-01"), dtype=bool)
+        _regime_mult[_pre2020] *= 1.5
     _train_weights = (_sample_w * _regime_mult).astype(np.float32)
 
     logger.info("Building GPU batch samplers...")
