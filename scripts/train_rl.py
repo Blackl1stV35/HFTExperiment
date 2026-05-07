@@ -560,12 +560,32 @@ def main():
     if args.resume_agent:
         logger.info(f"Option B: resuming agent from {args.resume_agent}")
         rl_ckpt = torch.load(args.resume_agent, map_location=device)
-        agent.actor.load_state_dict(rl_ckpt["actor"])
-        agent.critic1.load_state_dict(rl_ckpt["critic1"])
-        agent.critic2.load_state_dict(rl_ckpt["critic2"])
-        agent.target_critic1.load_state_dict(rl_ckpt["critic1"])
-        agent.target_critic2.load_state_dict(rl_ckpt["critic2"])
-        logger.info("  Agent weights loaded (replay buffer reset — flat-cost hardening)")
+
+        def _pad_state_dict(sd, new_obs_dim):
+            """Pad first-layer weight if obs_dim increased. New dims init to zero
+            so new features start as no-ops — policy learns their value from experience."""
+            sd = {k: v.clone() for k, v in sd.items()}
+            first_w_key = "0.weight"   # Sequential actor/critic: layer 0
+            if first_w_key in sd:
+                old_w = sd[first_w_key]          # (hidden, old_obs)
+                old_in = old_w.shape[1]
+                if old_in < new_obs_dim:
+                    pad = torch.zeros(old_w.shape[0], new_obs_dim - old_in,
+                                      dtype=old_w.dtype, device=old_w.device)
+                    sd[first_w_key] = torch.cat([old_w, pad], dim=1)
+                    logger.info(f"  Padded {first_w_key}: {old_in}→{new_obs_dim} input dims")
+            return sd
+
+        obs_dim = 16
+        actor_sd  = _pad_state_dict(rl_ckpt["actor"],  obs_dim)
+        critic1_sd = _pad_state_dict(rl_ckpt["critic1"], obs_dim + 2)
+        critic2_sd = _pad_state_dict(rl_ckpt["critic2"], obs_dim + 2)
+        agent.actor.load_state_dict(actor_sd)
+        agent.critic1.load_state_dict(critic1_sd)
+        agent.critic2.load_state_dict(critic2_sd)
+        agent.target_critic1.load_state_dict(critic1_sd)
+        agent.target_critic2.load_state_dict(critic2_sd)
+        logger.info("  Agent weights loaded with zero-padded obs dim (replay buffer reset)")
     mode_str = "flat-cost hardening" if args.flat_costs else f"cost curriculum n_evolves={args.n_evolves}"
     logger.info(
         f"RL Phase 5: {mode_str}\n"
