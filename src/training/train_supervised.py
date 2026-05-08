@@ -358,7 +358,27 @@ class Trainer:
 
     def load_checkpoint(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state_dict"])
+        sd   = ckpt["model_state_dict"]
+
+        # New architecture parameters (e.g. head_scale from head-wise RMSNorm)
+        # will be missing from older checkpoints. Load with strict=False and
+        # initialise missing keys to their default values (ones for scale params,
+        # zeros for bias params) so training resumes correctly.
+        missing, unexpected = self.model.load_state_dict(sd, strict=False)
+        if missing:
+            logger.info(f"  New params not in checkpoint (init to default): {missing}")
+            # Initialise missing scale parameters to ones (identity transform)
+            for key in missing:
+                param = dict(self.model.named_parameters()).get(key)
+                if param is not None:
+                    if "scale" in key or "weight" in key:
+                        nn.init.ones_(param)
+                    else:
+                        nn.init.zeros_(param)
+            logger.info(f"  Initialised {len(missing)} missing params to default values")
+        if unexpected:
+            logger.warning(f"  Unexpected keys in checkpoint (ignored): {unexpected}")
+
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.start_epoch       = ckpt.get("epoch", 0) + 1
         self.best_signal_score = ckpt.get("metrics", {}).get("signal_score", 0.0)
