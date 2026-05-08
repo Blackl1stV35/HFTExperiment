@@ -495,27 +495,14 @@ def main():
     logger.info(f"ret_1h: mean={ret_1h_arr.mean():.4f} std={ret_1h_arr.std():.4f}")
     logger.info(f"ret_15m: mean={ret_15m_arr.mean():.4f} std={ret_15m_arr.std():.4f}")
 
-    # ── Phase 8: inventory_pressure_vio ──────────────────────────────────────
-    # VIO[t] = Σ(V_k × sign_k) / Σ(V_k)  over rolling W=20 bars
-    # Phase 8 results: KS=0.112, MI=0.01076 (1.92x OHLCV mean), Red=2.62 (RL safe).
-    # tick_volume_raw from NPZ if available; falls back to uniform volume (VIO→mean direction).
-    logger.info("Computing inventory_pressure_vio (Phase 8 obs[15])...")
-    W_vio = 20
-    try:
-        tick_vol = _d["tick_volume_raw"].astype(np.float64)
-        logger.info("tick_volume_raw found in NPZ — using true VIO")
-    except Exception:
-        tick_vol = np.ones(len(seq_prices), dtype=np.float64)
-        tick_vol = np.ones(len(seq_prices), dtype=np.float64)
-        logger.warning("tick_volume_raw not in NPZ — using uniform volume (VIO≈mean direction)")
-    bar_dir = np.sign(seq_prices - np.concatenate([[seq_prices[0]], seq_prices[:-1]])).astype(np.float64)
-    inv_pressure_arr = np.empty(len(seq_prices), dtype=np.float32)
-    for i in range(len(seq_prices)):
-        lo  = max(0, i - W_vio + 1)
-        num = np.sum(tick_vol[lo:i+1] * bar_dir[lo:i+1])
-        den = np.sum(tick_vol[lo:i+1]) + 1e-8
-        inv_pressure_arr[i] = float(num / den)
-    logger.info(f"inv_pressure: mean={inv_pressure_arr.mean():.4f} std={inv_pressure_arr.std():.4f}")
+    # ── Phase 8 post-mortem: VIO DISABLED ────────────────────────────────────
+    # Phase 6 regression: true VIO (std=0.030) caused WR collapse 51.2%->41.5%.
+    # Root cause: XAUUSD M1 tick volume zero-inflation (Asian session near-constant)
+    # makes VIO near-flat (6x lower amplitude than uniform fallback).
+    # Fix: zero obs[15] until session-aware VIO normalisation is implemented.
+    # Revival path: compute VIO on London+NY hours only, zero-pad Asian session.
+    inv_pressure_arr = np.zeros(len(seq_prices), dtype=np.float32)
+    logger.info("inv_pressure obs[15]: DISABLED (VIO zero-inflation, Phase 6 post-mortem)")
 
     split = int(len(signals) * 0.8)
     logger.info(f"Train={split:,} Eval={len(signals)-split:,}")
