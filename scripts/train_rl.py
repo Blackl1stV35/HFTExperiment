@@ -495,14 +495,55 @@ def main():
     logger.info(f"ret_1h: mean={ret_1h_arr.mean():.4f} std={ret_1h_arr.std():.4f}")
     logger.info(f"ret_15m: mean={ret_15m_arr.mean():.4f} std={ret_15m_arr.std():.4f}")
 
-    # ── Phase 8 post-mortem: VIO DISABLED ────────────────────────────────────
-    # Phase 6 regression: true VIO (std=0.030) caused WR collapse 51.2%->41.5%.
-    # Root cause: XAUUSD M1 tick volume zero-inflation (Asian session near-constant)
-    # makes VIO near-flat (6x lower amplitude than uniform fallback).
-    # Fix: zero obs[15] until session-aware VIO normalisation is implemented.
-    # Revival path: compute VIO on London+NY hours only, zero-pad Asian session.
-    inv_pressure_arr = np.zeros(len(seq_prices), dtype=np.float32)
-    logger.info("inv_pressure obs[15]: DISABLED (VIO zero-inflation, Phase 6 post-mortem)")
+    # ── Session-aware VIO (Phase 8 fix) ──────────────────────────────────────
+    # Phase 6 root cause: XAUUSD M1 tick volume near-constant during Asian session
+    # (00:00-08:00 UTC / 07:00-15:00 Bangkok time) → VIO denominator Σ(V) ≈ flat
+    # → VIO std=0.030 (6x lower than uniform fallback) → policy gradient noise.
+    #
+    # Fix: compute VIO only during active sessions (London+NY: 08:00-22:00 UTC).
+    # Zero-pad Asian session bars. This also aligns with Thai retail trading hours
+    # (Bangkok UTC+7: London open 15:00-17:00 BKK, NY session 19:30-00:00 BKK).
+    #
+    # Rationale: Asian session XAUUSD has systematically lower directional signal
+    # (Phase 6 session_enc KS=0.122 confirms session-phase discriminates sell labels).
+    # Zeroing Asian VIO is both technically correct AND strategically appropriate
+    # for a Thai trader whose active hours are London+NY overlap.
+    logger.info("Computing session-aware VIO (London+NY only, Asian=0)...")
+    W_vio     = 20
+    ACTIVE_UTC_START = 8   # London open
+    ACTIVE_UTC_END   = 22  # NY close (approx)
+
+    # Extract UTC hour from timestamps_ns (int64 nanoseconds since epoch)
+    if seq_ts is not None:
+        utc_hours   = ((np.asarray(seq_ts, dtype=np.int64) // (3600 * 10**9)) % 24).astype(np.int32)
+        active_mask = (utc_hours >= ACTIVE_UTC_START) & (utc_hours < ACTIVE_UTC_END)
+        logger.info(f"  UTC hours extracted from timestamps_ns")
+    else:
+        # Fallback: no timestamp data — assume all bars are active
+        active_mask = np.ones(len(seq_prices), dtype=bool)
+        logger.warning("seq_ts not available — session-aware VIO fallback: all bars active")
+
+    try:
+        tick_vol = _d["tick_volume_raw"].astype(np.float64)
+        # Zero out Asian session volume — preserves denominator stability
+        tick_vol = tick_vol * active_mask
+        logger.info(f"  tick_volume_raw loaded | active bars={active_mask.sum():,} "
+                    f"({100*active_mask.mean():.1f}%) | Asian zeroed")
+    except Exception:
+        tick_vol = active_mask.astype(np.float64)   # uniform vol, active only
+        logger.warning("tick_volume_raw not in NPZ — using session-masked uniform volume")
+
+    bar_dir = np.sign(seq_prices - np.concatenate([[seq_prices[0]], seq_prices[:-1]])).astype(np.float64)
+    inv_pressure_arr = np.empty(len(seq_prices), dtype=np.float32)
+    for i in range(len(seq_prices)):
+        lo  = max(0, i - W_vio + 1)
+        num = np.sum(tick_vol[lo:i+1] * bar_dir[lo:i+1])
+        den = np.sum(tick_vol[lo:i+1]) + 1e-8
+        inv_pressure_arr[i] = float(num / den)
+
+    logger.info(f"  inv_pressure: mean={inv_pressure_arr.mean():.4f} "
+                f"std={inv_pressure_arr.std():.4f} "
+                f"(Asian bars = {(~active_mask).sum():,} zeroed)")
 
     split = int(len(signals) * 0.8)
     logger.info(f"Train={split:,} Eval={len(signals)-split:,}")

@@ -135,6 +135,13 @@ class TransformerEncoderLayer(nn.Module):
         mask = torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1)
         self.register_buffer("causal_mask", mask)
 
+        # Head-wise RMSNorm after value aggregation (Li et al. ICML 2026).
+        # Suppresses bar-0 attention sink from causal masking variance discrepancy.
+        # Initialises at identity — adds d_model=512 params (0.003% of model).
+        # Long stream TransformerBlock only; short stream (LocalCausalAttention
+        # w=20) is already sink-free — bar 0 of w=20 is bar 220, semantically recent.
+        self.head_scale = nn.Parameter(torch.ones(n_heads, 1, self.d_k))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, d_model)
         B, T, D = x.shape
@@ -151,6 +158,10 @@ class TransformerEncoderLayer(nn.Module):
             dropout_p = self.attn_drop if self.training else 0.0,
             is_causal  = False,
         )
+        # Head-wise RMSNorm (Li et al. ICML 2026): normalise each head's output
+        # to suppress bar-0 variance outlier before output projection amplifies it.
+        # attn_out: (B, n_heads, T, d_head) — norm over d_head dim, scale per head.
+        attn_out = attn_out / (attn_out.norm(dim=-1, keepdim=True) + 1e-8)                    * self.head_scale                                           # broadcast (B,H,T,dk)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
         x = x + self.out_proj(attn_out)
 
@@ -332,6 +343,7 @@ class TransformerPriceBranch(nn.Module):
         tcn_layers:          int   = None,
         tcn_kernel_size:     int   = None,
         price_dropout:       float = None,
+        n_bypass:    int   = 0,    # Phase 6: extra features injected post-scatter
         **_kwargs,
     ):
         super().__init__()
@@ -400,6 +412,18 @@ class TransformerPriceBranch(nn.Module):
         # Temperature scaling (post-training calibration — not trained with model)
         self.temp_scale = TemperatureScaling(init_T=1.5)
 
+        # Phase 6 bypass: extra features (DXY, VWAP, session, MTF) skip scattering.
+        # Scattering is designed for OHLCV microstructure — slow-moving exogenous
+        # features alias badly through its filter bank. Project directly into
+        # the d_model residual stream after attention pooling. n_bypass=0 → no-op.
+        self.n_bypass = n_bypass
+        if n_bypass > 0:
+            self.bypass_proj = nn.Sequential(
+                nn.Linear(n_bypass, d_model),
+                nn.LayerNorm(d_model),
+                nn.GELU(),
+            )
+
         self.d_model        = d_model
         self.out_dim        = d_model
         self.attn_window    = attn_window
@@ -422,7 +446,9 @@ class TransformerPriceBranch(nn.Module):
             seq_features: (B, T_s=120, d_model)
         """
         # ── Long stream ───────────────────────────────────────────────────────
-        x_long   = x[:, :, self._LONG_IDX]           # (B, 240, 8)
+        # First 10 dims only → scattering (bypass features skip filter bank)
+        x_base   = x[:, :, :10] if x.shape[-1] > 10 else x
+        x_long   = x_base[:, :, self._LONG_IDX]      # (B, 240, 8)
         scattered = self.scatter(x_long)              # (B, 120, 104)
         h        = self.scatter_proj(scattered)       # (B, 120, d_model)
 
@@ -443,7 +469,7 @@ class TransformerPriceBranch(nn.Module):
         long_pooled  = (h * long_weights.unsqueeze(-1)).sum(1)  # (B, d_model)
 
         # ── Short stream: LocalCausalAttention → AstrocyteGating ────────────
-        x_short  = x[:, -self.attn_window:, :][:, :, self._SHORT_IDX]
+        x_short  = x_base[:, -self.attn_window:, self._SHORT_IDX]  # last 20 bars, short dims
         h_short  = self.short_proj(x_short)
         for layer in self.short_attn:
             h_short = layer(h_short)
@@ -451,6 +477,14 @@ class TransformerPriceBranch(nn.Module):
         # Astrocyte routing: content-addressed pool with regime-conditional T
         # Replaces the fixed softmax-pool — gains concentrate on relevant patterns
         short_pooled = self.astrocyte(h_short, regime)  # (B, d_model)
+
+        # ── Phase 6 bypass injection ─────────────────────────────────────────
+        # Inject exogenous features (DXY, VWAP, session, MTF) into long_pooled
+        # residual stream. Last bar's bypass dims are sufficient — these are
+        # slow-moving signals representing current regime context, not sequence.
+        if self.n_bypass > 0 and x.shape[-1] > 10:
+            x_bp        = x[:, -1, 10:10 + self.n_bypass]  # (B, n_bypass)
+            long_pooled = long_pooled + self.bypass_proj(x_bp)
 
         # ── Fusion ────────────────────────────────────────────────────────────
         pooled       = self.fusion(torch.cat([long_pooled, short_pooled], dim=-1))

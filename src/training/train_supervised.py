@@ -685,8 +685,8 @@ def main(cfg: DictConfig) -> None:
         timestamps        = ts_train,
         class_weights_cfg = cw_cfg,
         epoch_size        = epoch_size,
-        vol_enc           = vol_train,      # Phase B: Bear+HIGH x3.5 oversampling
-        bear_high_mult    = 3.5,
+        vol_enc           = vol_train,      # Run 10: Bear+HIGH x2.5 (softer than x3.5)
+        bear_high_mult    = 2.5,
     )
     # Extract per-sample weights from the sampler for torch.multinomial
     _ds_tmp = SequenceDataset(features, labels, seq_len)
@@ -701,7 +701,7 @@ def main(cfg: DictConfig) -> None:
         bear_mask_gpu = gmm2_train < 0.5
         if vol_train is not None:
             high_mask_gpu      = vol_train >= 0.67
-            _regime_mult[bear_mask_gpu & high_mask_gpu]  = 3.5   # Bear+HIGH
+            _regime_mult[bear_mask_gpu & high_mask_gpu]  = 2.5   # Bear+HIGH (Run 10: x2.5)
             _regime_mult[bear_mask_gpu & ~high_mask_gpu] = 2.0   # Bear-only
         else:
             _regime_mult[bear_mask_gpu] = 2.0
