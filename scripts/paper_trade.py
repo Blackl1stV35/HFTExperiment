@@ -40,14 +40,28 @@ from src.utils.config import load_env, setup_logger
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _load_supervised(checkpoint_path: str, cfg_path: str):
-    """Load frozen DualBranchModel from .pt checkpoint."""
+    """Load frozen DualBranchModel from .pt checkpoint.
+
+    Uses DualBranchModel.from_config() so classifier_dims and all arch
+    params are read from the yaml correctly (avoids __init__ default mismatch).
+    Falls back to strict=False with missing/unexpected key logging if there
+    is any remaining mismatch (e.g. local vs Colab yaml drift).
+    """
     from omegaconf import OmegaConf
     from src.encoder.fusion import DualBranchModel
 
-    cfg = OmegaConf.load(cfg_path)
-    model = DualBranchModel(cfg)
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    cfg   = OmegaConf.load(cfg_path)
+    model = DualBranchModel.from_config(cfg)
+    ckpt  = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    missing, unexpected = model.load_state_dict(
+        ckpt["model_state_dict"], strict=False
+    )
+    if missing:
+        logger.warning(f"  Missing keys in checkpoint: {missing}")
+    if unexpected:
+        logger.warning(f"  Unexpected keys in checkpoint: {unexpected}")
+    if not missing and not unexpected:
+        logger.info("  State dict loaded cleanly (strict match)")
     model.eval()
     logger.info(f"Supervised model loaded: {checkpoint_path}")
     return model
