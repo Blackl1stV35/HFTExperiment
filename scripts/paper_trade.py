@@ -552,9 +552,10 @@ class TradingLoop:
                 closes     = np.array([b["close"] for b in bars])
                 ret_1h     = mtf_return_zscored(closes, window=60)
                 ret_15m    = mtf_return_zscored(closes, window=15)
-                atr_n      = _atr_norm(bars)
-                trend_n    = _trend_norm(bars)
-                session_ph = _session_phase(bars)
+                # Scale obs features to match training distribution
+                atr_n      = float(np.tanh(_atr_norm(bars) * 30))   # raw ~0.004 → tanh(×30) ≈ 0.12
+                trend_n    = _trend_norm(bars)                       # already tanh(×50)
+                session_ph = _session_phase(bars)                    # already [0, 0.5, 1.0]
 
                 pos_dir     = 0.0
                 unreal_pnl  = 0.0
@@ -562,8 +563,11 @@ class TradingLoop:
                 if self.position is not None:
                     pos_dir    = float(self.position["dir"])
                     cur_price  = bars[-1]["close"]
+                    # XAUUSD PnL: price_diff × lots × 100 = $ value
+                    # (1 standard lot = $100/point → 0.01 lot = $1/point)
                     unreal_pnl = (cur_price - self.position["entry_price"]) \
-                                 * self.position["dir"] * 100.0  # approx $
+                                 * self.position["dir"] \
+                                 * self.position["lots"] * 100.0
                     hold_frac  = min(1.0, self.hold_bars / self.max_hold)
 
                 rl_obs = build_rl_obs(
@@ -588,7 +592,7 @@ class TradingLoop:
                     self.hold_bars += 1
                     should_exit = (
                         exit_signal < EXIT_THRESHOLD
-                        or self.hold_bars >= self.max_hold
+                        or (not self.synthetic and self.hold_bars >= self.max_hold)
                     )
                     if should_exit:
                         exit_reason = "rl_exit" if exit_signal < EXIT_THRESHOLD \
@@ -688,9 +692,11 @@ class TradingLoop:
                     f"| gmm2={'Bear' if gmm2==0 else 'Bull'} vol={'HIGH' if vol_enc else 'LOW'}"
                 )
 
-                # Wait for next bar (skip if synthetic/fast mode)
+                # Wait for next bar
                 if not self.synthetic:
                     time.sleep(max(1, bar_interval_s - 5))
+                else:
+                    time.sleep(0.2)  # slow synthetic enough to observe logs
 
             except Exception as e:
                 logger.error(f"Loop error: {e}", exc_info=True)

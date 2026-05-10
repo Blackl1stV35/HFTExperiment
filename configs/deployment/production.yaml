@@ -31,7 +31,7 @@ risk:
   max_daily_drawdown_pct: 2.0  # halt if daily loss > 2% of account
   max_consecutive_losses: 5    # reduce size after 5 consecutive losses
   loss_reduction_factor: 0.5   # halve position size when streak active
-  latency_kill_ms: 50.0        # skip bar if inference > 50ms
+  latency_kill_ms: 500.0        # skip bar if inference > 500ms
   max_hold_bars: 80            # force close after 80 bars (~80 min on M1)
   news_blackout_minutes: 30    # no trading 30 min around FOMC/NFP/CPI
 
