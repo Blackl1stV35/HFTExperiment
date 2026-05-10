@@ -1,35 +1,60 @@
 name: production
 mode: paper  # paper | live
 
+# ── Inference ─────────────────────────────────────────────────────────────────
 inference:
-  engine: onnx
-  device: cpu
-  model_path: exports/best_model.onnx
-  max_latency_ms: 5.0
+  engine: pytorch                                    # Phase 8b: direct .pt load (no ONNX)
+  device: cpu                                        # CPU sufficient — 19.5M params, ~3-5ms
+  supervised_checkpoint: models/dual_branch_last.pt  # Run 10 ep61 — sell P=0.301
+  rl_checkpoint: models/rl_agent_evolve2.pt           # Phase 8b evolve2 — 51.2% WR
+  model_config: configs/model/dual_branch.yaml
+  max_latency_ms: 50.0
 
+# ── Deploy gate ───────────────────────────────────────────────────────────────
+# Bear+HIGH vol regime: agent trained on this regime but signal is sparse.
+# Skip entries when both conditions are true to preserve edge.
+deploy_gate:
+  enabled: true
+  block_bear_high: true        # gmm2==Bear AND vol==HIGH → do not trade
+  regime_lookback_bars: 60     # bars used for ATR baseline
+
+# ── Broker ────────────────────────────────────────────────────────────────────
 broker:
   type: mt5
   symbol: XAUUSD
-  lot_size: 0.01
-  max_lots: 0.10
-  magic_number: 20260101
+  lot_size: 0.01               # fixed during paper trade (0.01 lot = ~$1/pip)
+  max_lots: 0.01               # single position only — no scaling
+  magic_number: 20260509       # identifies this EA in MT5 position list
 
+# ── Risk ──────────────────────────────────────────────────────────────────────
 risk:
-  max_daily_drawdown_pct: 2.0
-  max_position_risk_pct: 2.0
-  max_consecutive_losses: 5
-  loss_reduction_factor: 0.5
-  latency_kill_ms: 50.0
-  news_blackout_minutes: 30
-  blackout_events: [FOMC, NFP, CPI, PPI, GDP]
-  human_exit_approval: true
+  max_daily_drawdown_pct: 2.0  # halt if daily loss > 2% of account
+  max_consecutive_losses: 5    # reduce size after 5 consecutive losses
+  loss_reduction_factor: 0.5   # halve position size when streak active
+  latency_kill_ms: 50.0        # skip bar if inference > 50ms
+  max_hold_bars: 80            # force close after 80 bars (~80 min on M1)
+  news_blackout_minutes: 30    # no trading 30 min around FOMC/NFP/CPI
 
+# ── HITL ──────────────────────────────────────────────────────────────────────
+# Human-in-the-loop approval gate (console prompt on Windows terminal)
 hitl:
   enabled: true
-  auto_approve_confidence: 0.7
-  auto_approve_max_lots: 0.03
+  auto_approve_confidence: 0.72   # entries above 72% confidence auto-approve
+  auto_approve_max_lots: 0.03     # auto-approve if lots <= 0.03
+  # Auto-approves profitable exits except during consecutive-loss streaks >= 3
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  trade_log: outputs/paper_trade_log.csv   # CSV: every entry/exit with full context
+  level: INFO
+
+# ── Monitoring ────────────────────────────────────────────────────────────────
 monitoring:
-  prometheus_port: 9090
-  telegram_enabled: true
-  heartbeat_interval: 300
+  telegram_enabled: true       # set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env
+  heartbeat_interval: 300      # send heartbeat every 5 min
+  prometheus_port: 9090        # optional — disable if not using Grafana
+
+# ── Validation targets (2-4 week paper trade) ─────────────────────────────────
+# WR >= 50.5% over 200+ trades  → proceed to real Pro account ($100 min)
+# WR <  48.0% for 5 consecutive days → stop and investigate
+# trades/day: 5-25 expected | gate activation: 10-20% of bars expected

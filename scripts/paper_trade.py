@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Paper/live trading with the dual-branch model + HITL.
+"""Paper/live trading — Phase 8b deployment.
+
+Inference stack:
+    1. MT5 M1 bars → 10-dim feature builder (matches precompute_features.py)
+    2. Frozen DualBranchModel (Run 10 ep61, dual_branch_last.pt)
+       → 3-class probs + confidence
+    3. Regime deploy gate: Bear+HIGH → skip bar
+    4. ConfidenceSACAgent (Phase 8b evolve2, rl_agent_evolve2.pt)
+       → action[0]=position_size, action[1]=exit_logit
 
 Usage:
     python scripts/paper_trade.py --config configs/deployment/production.yaml --synthetic
@@ -9,229 +17,698 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import signal as sig
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
+import torch
 import yaml
 from loguru import logger
 
-from src.data.preprocessing import WindowMinMaxScaler
-from src.hitl.mt5_interface import HITLGate, SignalContext, RiskDisplay
-from src.inference.onnx_engine import ONNXInferenceEngine
+from src.hitl.mt5_interface import HITLGate, SignalContext, DrawdownContext
 from src.risk.circuit_breaker import CircuitBreaker, PositionSizer
 from src.monitoring.alerts import TelegramAlerter
 from src.utils.config import load_env, setup_logger
 
 
-class TradingLoop:
-    """Main trading loop with dual-branch model + HITL approval."""
+# ── helpers ──────────────────────────────────────────────────────────────────
 
-    def __init__(self, config_path: str, synthetic: bool = False):
-        with open(config_path) as f:
-            self.config = yaml.safe_load(f)
-        self.synthetic = synthetic
-        self.running = False
+def _load_supervised(checkpoint_path: str, cfg_path: str):
+    """Load frozen DualBranchModel from .pt checkpoint."""
+    from omegaconf import OmegaConf
+    from src.encoder.fusion import DualBranchModel
 
-        self.engine = None
-        self.broker = None
-        self.circuit_breaker = None
-        self.hitl = None
-        self.scaler = WindowMinMaxScaler(window_size=120)
-        self.price_buffer = []
-        self.feature_buffer = []
+    cfg = OmegaConf.load(cfg_path)
+    model = DualBranchModel(cfg)
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    model.eval()
+    logger.info(f"Supervised model loaded: {checkpoint_path}")
+    return model
 
-    def initialize(self) -> bool:
-        load_env()
-        risk_cfg = self.config.get("risk", {})
-        hitl_cfg = self.config.get("hitl", {})
 
-        # Inference engine
-        model_path = self.config.get("inference", {}).get("model_path", "exports/best_model.onnx")
-        if not Path(model_path).exists():
-            logger.error(f"Model not found: {model_path}")
-            return False
+def _load_rl_agent(checkpoint_path: str):
+    """Load ConfidenceSACAgent from .pt checkpoint (obs_dim=16)."""
+    from src.meta_policy.rl_agent import ConfidenceSACAgent
 
-        self.engine = ONNXInferenceEngine(model_path, device="cpu", n_threads=4)
+    agent = ConfidenceSACAgent(obs_dim=16, hidden_dims=[512, 512], device="cpu")
+    agent.load(checkpoint_path)
+    logger.info(f"RL agent loaded: {checkpoint_path}")
+    return agent
 
-        # Risk
-        self.circuit_breaker = CircuitBreaker(
-            max_daily_drawdown_pct=risk_cfg.get("max_daily_drawdown_pct", 2.0),
-            max_consecutive_losses=risk_cfg.get("max_consecutive_losses", 5),
-            latency_kill_ms=risk_cfg.get("latency_kill_ms", 50.0),
-        )
 
-        # HITL gate
-        self.hitl = HITLGate(
-            enabled=hitl_cfg.get("enabled", True) and not self.synthetic,
-            auto_approve_confidence=hitl_cfg.get("auto_approve_confidence", 0.7),
-            auto_approve_max_lots=hitl_cfg.get("auto_approve_max_lots", 0.03),
-        )
+# ── feature engineering ───────────────────────────────────────────────────────
 
-        # Broker
-        if self.synthetic:
-            self.broker = SyntheticBroker()
-        else:
-            from src.execution.broker_mt5 import MT5Broker
-            from src.utils.config import BrokerConfig
-            bc = BrokerConfig.from_env()
-            self.broker = MT5Broker()
-            if not self.broker.connect(bc.login, bc.password, bc.server, bc.path):
-                return False
+def build_features(bars: list[dict]) -> np.ndarray | None:
+    """Convert 240 raw M1 bars → (240, 10) normalised feature array.
 
-        # Alerter
-        self.alerter = TelegramAlerter()
-        if not self.synthetic:
-            self.alerter.alert_startup()
+    Features match precompute_features.py exactly:
+        0  open_sc       RobustScaled open price
+        1  high_sc       RobustScaled high
+        2  low_sc        RobustScaled low
+        3  close_sc      RobustScaled close
+        4  vol_sc        RobustScaled tick_volume
+        5  spread_sc     RobustScaled spread (points)
+        6  bar_return_bps  log-return in basis points
+        7  wick_asymmetry  (high-close - close-low) / (high-low)
+        8  vol_zscore    tanh z-score of tick_volume over 20-bar window
+        9  spread_pressure  spread_sc * vol_zscore
+    """
+    if len(bars) < 240:
+        return None
+    b = bars[-240:]
 
-        logger.info("All components initialized")
-        return True
+    opens   = np.array([x["open"]        for x in b], dtype=np.float64)
+    highs   = np.array([x["high"]        for x in b], dtype=np.float64)
+    lows    = np.array([x["low"]         for x in b], dtype=np.float64)
+    closes  = np.array([x["close"]       for x in b], dtype=np.float64)
+    vols    = np.array([x["tick_volume"] for x in b], dtype=np.float64)
+    spreads = np.array([x["spread"]      for x in b], dtype=np.float64)
 
-    def run(self) -> None:
-        self.running = True
-        sig.signal(sig.SIGINT, lambda s, f: setattr(self, "running", False))
-        sig.signal(sig.SIGTERM, lambda s, f: setattr(self, "running", False))
+    def robust_scale(arr: np.ndarray) -> np.ndarray:
+        med = np.median(arr)
+        iqr = np.percentile(arr, 75) - np.percentile(arr, 25)
+        return np.clip((arr - med) / (iqr + 1e-8), -3.0, 3.0).astype(np.float32)
 
-        tick_count = 0
-        position = None  # (direction, entry_price, lots)
+    # bar_return_bps
+    log_ret = np.concatenate([[0.0], np.log(closes[1:] / (closes[:-1] + 1e-8))]) * 10_000
 
-        while self.running:
-            try:
-                tick = self._get_tick()
-                if tick is None:
-                    time.sleep(0.1)
-                    continue
+    # wick_asymmetry
+    hl = highs - lows + 1e-8
+    wick_asym = ((highs - closes) - (closes - lows)) / hl
 
-                tick_count += 1
-                self.price_buffer.append(tick["bid"])
-                self.feature_buffer.append([
-                    tick["bid"], tick["bid"] + 0.5, tick["bid"] - 0.5,
-                    tick["bid"], 100, tick.get("spread", 20),
-                ])
+    # vol_zscore: tanh z over 20-bar rolling window
+    vol_zsc = np.zeros(240, dtype=np.float32)
+    for i in range(240):
+        lo = max(0, i - 19)
+        w  = vols[lo:i + 1]
+        vol_zsc[i] = float(np.tanh((vols[i] - w.mean()) / (w.std() + 1e-8)))
 
-                if len(self.price_buffer) > 300:
-                    self.price_buffer = self.price_buffer[-300:]
-                    self.feature_buffer = self.feature_buffer[-300:]
+    spread_sc_raw = robust_scale(spreads)
+    spread_press  = spread_sc_raw * vol_zsc
 
-                seq_len = 120
-                if len(self.feature_buffer) < seq_len:
-                    continue
+    return np.stack([
+        robust_scale(opens),
+        robust_scale(highs),
+        robust_scale(lows),
+        robust_scale(closes),
+        robust_scale(vols),
+        spread_sc_raw,
+        log_ret.astype(np.float32),
+        wick_asym.astype(np.float32),
+        vol_zsc,
+        spread_press,
+    ], axis=1).astype(np.float32)   # (240, 10)
 
-                # Prepare input
-                features = np.array(self.feature_buffer[-seq_len:], dtype=np.float32)
-                scaled = self.scaler.transform(features).astype(np.float32)
-                input_seq = scaled.reshape(1, seq_len, -1)
 
-                # Inference — dual output: signal + confidence
-                output, latency = self.engine.predict_timed(x=input_seq)
+# ── regime detection ──────────────────────────────────────────────────────────
 
-                # Parse dual output: first 3 = logits, last 1 = confidence
-                if output.shape[-1] >= 4:
-                    logits = output[0, :3]
-                    confidence = float(1 / (1 + np.exp(-output[0, 3])))  # sigmoid
-                else:
-                    logits = output[0]
-                    confidence = float(np.max(np.exp(logits) / np.exp(logits).sum()))
+def get_regime(bars: list[dict], lookback: int = 60) -> tuple[float, float]:
+    """Estimate (gmm2, vol_enc) from recent bars.
 
-                probs = np.exp(logits - logits.max()) / np.exp(logits - logits.max()).sum()
-                action = int(probs.argmax())
+    gmm2:    0.0=Bear (20-bar return < 0), 1.0=Bull
+    vol_enc: 1.0=HIGH (ATR > 1.4× baseline), 0.0=LOW/NORMAL
 
-                # Circuit breaker
-                can_trade, reason = self.circuit_breaker.check_can_trade(latency)
-                if not can_trade:
-                    if tick_count % 100 == 0:
-                        logger.warning(f"Blocked: {reason}")
-                    continue
+    Returns (gmm2, vol_enc).
+    """
+    if len(bars) < lookback + 5:
+        return 1.0, 0.0   # default: Bull, LOW — safe to trade
 
-                # Display signal
-                if tick_count % 50 == 0:
-                    display = RiskDisplay.format_signal(action, confidence, tick["bid"])
-                    logger.info(f"Tick {tick_count} | {display} | Latency: {latency:.1f}ms")
+    closes = np.array([b["close"] for b in bars[-25:]])
+    ret20  = (closes[-1] - closes[-20]) / (closes[-20] + 1e-8)
+    gmm2   = 1.0 if ret20 >= 0 else 0.0
 
-                # Execute with HITL
-                if action != 1 and position is None:  # Entry
-                    ctx = SignalContext(
-                        action="BUY" if action == 2 else "SELL",
-                        confidence=confidence,
-                        current_price=tick["bid"],
-                        position_size_lots=min(0.01 * (1 + confidence * 4), 0.05),
-                    )
-                    if self.hitl.check_entry(ctx):
-                        if action == 2:
-                            result = self.broker.buy(ctx.position_size_lots)
-                        else:
-                            result = self.broker.sell(ctx.position_size_lots)
-                        if hasattr(result, "success") and result.success:
-                            position = (1 if action == 2 else -1, tick["bid"], ctx.position_size_lots)
+    recent = bars[-15:]
+    base   = bars[-lookback:-15]
+    atr_recent   = np.mean([b["high"] - b["low"] for b in recent])
+    atr_baseline = np.mean([b["high"] - b["low"] for b in base]) + 1e-8
+    vol_enc = 1.0 if atr_recent > atr_baseline * 1.4 else 0.0
 
-                elif action != 1 and position and action != (1 + position[0]):  # Exit signal
-                    ctx = SignalContext(
-                        action="CLOSE",
-                        confidence=confidence,
-                        current_price=tick["bid"],
-                        entry_price=position[1],
-                        unrealized_pnl=(tick["bid"] - position[1]) * position[0],
-                        exit_reason="signal_reverse",
-                    )
-                    if self.hitl.check_exit(ctx):
-                        positions = self.broker.get_open_positions()
-                        for p in positions:
-                            self.broker.close_position(p["ticket"])
-                        position = None
+    return gmm2, vol_enc
 
-            except Exception as e:
-                logger.error(f"Error: {e}", exc_info=True)
-                time.sleep(1)
 
-        logger.info(f"Shutdown. HITL stats: {self.hitl.stats}")
-        if not self.synthetic:
-            self.alerter.alert_shutdown()
+# ── MTF return (ret_1h, ret_15m) ─────────────────────────────────────────────
 
-    def _get_tick(self):
-        if self.synthetic:
-            if not self.price_buffer:
-                price = 2000.0
-            else:
-                price = self.price_buffer[-1] + np.random.normal(0, 0.1)
-            time.sleep(0.01)
-            return {"bid": price, "ask": price + 0.02, "spread": 20}
-        return self.broker.get_tick()
+def mtf_return_zscored(closes: np.ndarray, window: int) -> float:
+    """Z-scored cumulative log-return over `window` bars, tanh-bounded."""
+    if len(closes) < window + 10:
+        return 0.0
+    log_rets = np.log(closes[1:] / (closes[:-1] + 1e-8))
+    cumret   = np.convolve(log_rets, np.ones(window), mode="valid")
+    if len(cumret) < 2:
+        return 0.0
+    return float(np.tanh((cumret[-1] - cumret.mean()) / (cumret.std() + 1e-8)))
 
+
+# ── supervised inference ──────────────────────────────────────────────────────
+
+@torch.no_grad()
+def run_supervised(model, features: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Run DualBranchModel on (240, 10) feature array.
+
+    Returns:
+        probs      (3,) softmax probabilities [sell, hold, buy]
+        confidence float scalar
+        latency_ms float
+    """
+    x = torch.FloatTensor(features).unsqueeze(0)  # (1, 240, 10)
+    t0 = time.perf_counter()
+    logits, conf_logit = model(x)
+    latency_ms = (time.perf_counter() - t0) * 1000
+
+    probs = torch.softmax(logits, dim=-1).squeeze(0).numpy()
+    confidence = float(torch.sigmoid(conf_logit).squeeze())
+    return probs, confidence, latency_ms
+
+
+# ── RL obs builder ────────────────────────────────────────────────────────────
+
+def build_rl_obs(
+    probs: np.ndarray,
+    confidence: float,
+    position_dir: float,
+    unrealized_pnl: float,
+    hold_frac: float,
+    atr_norm: float,
+    trend_norm: float,
+    session_phase: float,
+    regime_quality: float,
+    gs_quartile: float,
+    cu_au_regime: float,
+    ret_1h: float,
+    ret_15m: float,
+) -> np.ndarray:
+    """Build 16-dim RL observation vector matching train_rl.py exactly.
+
+    obs[15] = 0.0 (VIO disabled — bimodal instability, see Phase 6/8 post-mortems)
+    """
+    return np.array([
+        probs[0], probs[1], probs[2], confidence,           # 0-3
+        position_dir, unrealized_pnl, hold_frac,            # 4-6
+        atr_norm, trend_norm, session_phase,                 # 7-9
+        regime_quality, gs_quartile, cu_au_regime,           # 10-12
+        ret_1h, ret_15m,                                     # 13-14
+        0.0,                                                 # 15 VIO disabled
+    ], dtype=np.float32)
+
+
+# ── RL action ─────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def run_rl(agent, obs: np.ndarray) -> tuple[float, float, float]:
+    """Run RL actor deterministically.
+
+    Returns:
+        size_signal  float in [-1, +1] (actor[0])
+        exit_signal  float in [-1, +1] (actor[1])
+        latency_ms   float
+    """
+    x = torch.FloatTensor(obs).unsqueeze(0)
+    t0 = time.perf_counter()
+    action = agent.actor(x).squeeze(0).numpy()
+    latency_ms = (time.perf_counter() - t0) * 1000
+    return float(action[0]), float(action[1]), latency_ms
+
+
+# ── obs helper features ───────────────────────────────────────────────────────
+
+def _atr_norm(bars: list[dict], window: int = 14) -> float:
+    if len(bars) < window + 1:
+        return 0.01
+    trs = [b["high"] - b["low"] for b in bars[-window:]]
+    close_avg = np.mean([b["close"] for b in bars[-window:]])
+    return float(np.mean(trs) / (close_avg + 1e-8))
+
+
+def _trend_norm(bars: list[dict], window: int = 20) -> float:
+    if len(bars) < window + 1:
+        return 0.0
+    closes = np.array([b["close"] for b in bars[-window:]])
+    ret = (closes[-1] - closes[0]) / (abs(closes[0]) + 1e-8)
+    return float(np.tanh(ret * 50))
+
+
+def _session_phase(bars: list[dict]) -> float:
+    """0=Asian 0.5=London 1.0=NY based on UTC hour of latest bar."""
+    if not bars:
+        return 0.5
+    ts = bars[-1].get("time", time.time())
+    hour = datetime.fromtimestamp(ts, tz=timezone.utc).hour
+    if 8 <= hour < 13:
+        return 0.5   # London
+    elif 13 <= hour < 22:
+        return 1.0   # NY
+    return 0.0       # Asian
+
+
+# ── synthetic broker ──────────────────────────────────────────────────────────
 
 class SyntheticBroker:
     def __init__(self):
-        self._positions = {}
         self._ticket = 1000
+        self._price  = 3300.0
+
+    def get_m1_bars(self, n: int) -> list[dict]:
+        bars = []
+        p = self._price
+        for _ in range(n):
+            o = p
+            h = p + abs(np.random.normal(0, 0.5))
+            l = p - abs(np.random.normal(0, 0.5))
+            c = p + np.random.normal(0, 0.3)
+            bars.append({"open": o, "high": h, "low": l, "close": c,
+                         "tick_volume": max(1, int(np.random.normal(50, 20))),
+                         "spread": 6, "time": time.time()})
+            p = c
+        self._price = p
+        return bars
 
     def buy(self, vol, comment=""):
         from src.execution.broker_mt5 import OrderResult
         self._ticket += 1
-        return OrderResult(success=True, ticket=self._ticket, price=2000, volume=vol, latency_ms=0.1)
+        return OrderResult(success=True, ticket=self._ticket,
+                           price=self._price, volume=vol, latency_ms=0.1)
 
     def sell(self, vol, comment=""):
         from src.execution.broker_mt5 import OrderResult
         self._ticket += 1
-        return OrderResult(success=True, ticket=self._ticket, price=2000, volume=vol, latency_ms=0.1)
+        return OrderResult(success=True, ticket=self._ticket,
+                           price=self._price, volume=vol, latency_ms=0.1)
 
-    def close_position(self, ticket):
+    def close_position(self, ticket, comment=""):
         from src.execution.broker_mt5 import OrderResult
-        return OrderResult(success=True, ticket=ticket, price=2000, latency_ms=0.1)
+        return OrderResult(success=True, ticket=ticket,
+                           price=self._price, latency_ms=0.1)
 
     def get_open_positions(self):
         return []
 
-    def get_tick(self):
-        return None
+    def get_account_info(self):
+        return {"balance": 100_000.0, "equity": 100_000.0}
 
+
+# ── MT5 bar fetcher ───────────────────────────────────────────────────────────
+
+class MT5BarFetcher:
+    """Wrapper around MT5 copy_rates_from_pos for M1 bar retrieval."""
+
+    def __init__(self, symbol: str = "XAUUSD"):
+        self.symbol = symbol
+        self._mt5 = None
+
+    def connect(self, login: str, password: str, server: str,
+                path: str | None = None) -> bool:
+        try:
+            import MetaTrader5 as mt5
+            self._mt5 = mt5
+            kwargs = {"path": path} if path else {}
+            if not mt5.initialize(**kwargs):
+                logger.error(f"MT5 init failed: {mt5.last_error()}")
+                return False
+            if not mt5.login(int(login), password=password, server=server):
+                logger.error(f"MT5 login failed: {mt5.last_error()}")
+                return False
+            if not mt5.symbol_select(self.symbol, True):
+                logger.error(f"Symbol {self.symbol} not available")
+                return False
+            logger.info(f"MT5 connected to {server}")
+            return True
+        except ImportError:
+            logger.error("MetaTrader5 not installed — run: pip install MetaTrader5")
+            return False
+
+    def get_m1_bars(self, n: int = 245) -> list[dict]:
+        if self._mt5 is None:
+            return []
+        rates = self._mt5.copy_rates_from_pos(self.symbol, self._mt5.TIMEFRAME_M1, 0, n)
+        if rates is None or len(rates) == 0:
+            return []
+        return [
+            {
+                "open":        float(r["open"]),
+                "high":        float(r["high"]),
+                "low":         float(r["low"]),
+                "close":       float(r["close"]),
+                "tick_volume": int(r["tick_volume"]),
+                "spread":      int(r["spread"]),
+                "time":        int(r["time"]),
+            }
+            for r in rates
+        ]
+
+
+# ── main trading loop ─────────────────────────────────────────────────────────
+
+class TradingLoop:
+    """Phase 8b paper trading loop.
+
+    Decision pipeline each bar:
+        M1 bars → feature build (240-bar) → supervised inference
+        → regime gate → RL obs → RL action
+        → HITL → MT5 order
+    """
+
+    def __init__(self, config_path: str, synthetic: bool = False):
+        with open(config_path) as f:
+            self.cfg = yaml.safe_load(f)
+        self.synthetic = synthetic
+        self.running   = False
+
+        self.sup_model  = None
+        self.rl_agent   = None
+        self.broker     = None
+        self.bar_fetcher = None
+        self.circuit_breaker = None
+        self.hitl       = None
+        self.alerter    = None
+
+        # Position state
+        self.position: dict | None = None  # {dir, entry_price, lots, ticket, hold_bars}
+        self.hold_bars = 0
+        self.max_hold  = self.cfg.get("risk", {}).get("max_hold_bars", 80)
+
+        # Paper trade log
+        log_path = Path(self.cfg.get("logging", {}).get("trade_log",
+                                    "outputs/paper_trade_log.csv"))
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_file = open(log_path, "a", newline="")
+        self._log = csv.writer(self._log_file)
+        if log_path.stat().st_size == 0:
+            self._log.writerow([
+                "timestamp", "bar_time", "action", "direction",
+                "entry_price", "close_price", "lots", "pnl_usd",
+                "confidence", "rl_size", "rl_exit",
+                "regime_gmm2", "regime_vol", "gated",
+                "sell_p", "hold_p", "buy_p",
+            ])
+            self._log_file.flush()
+
+    # ── init ──────────────────────────────────────────────────────────────────
+
+    def initialize(self) -> bool:
+        load_env()
+        inf_cfg  = self.cfg.get("inference", {})
+        risk_cfg = self.cfg.get("risk", {})
+        hitl_cfg = self.cfg.get("hitl", {})
+        mon_cfg  = self.cfg.get("monitoring", {})
+
+        # Supervised model
+        sup_ckpt  = inf_cfg.get("supervised_checkpoint", "models/dual_branch_last.pt")
+        model_cfg = inf_cfg.get("model_config", "configs/model/dual_branch.yaml")
+        if not Path(sup_ckpt).exists():
+            logger.error(f"Supervised checkpoint not found: {sup_ckpt}")
+            return False
+        self.sup_model = _load_supervised(sup_ckpt, model_cfg)
+
+        # RL agent
+        rl_ckpt = inf_cfg.get("rl_checkpoint", "models/rl_agent_evolve2.pt")
+        if not Path(rl_ckpt).exists():
+            logger.error(f"RL checkpoint not found: {rl_ckpt}")
+            return False
+        self.rl_agent = _load_rl_agent(rl_ckpt)
+
+        # Circuit breaker
+        acct_info = {"balance": 100_000.0}  # updated each loop from broker
+        self.circuit_breaker = CircuitBreaker(
+            max_daily_drawdown_pct=risk_cfg.get("max_daily_drawdown_pct", 2.0),
+            max_consecutive_losses=risk_cfg.get("max_consecutive_losses", 5),
+            latency_kill_ms=risk_cfg.get("latency_kill_ms", 50.0),
+            account_balance=acct_info["balance"],
+        )
+
+        # HITL
+        self.hitl = HITLGate(
+            enabled=hitl_cfg.get("enabled", True) and not self.synthetic,
+            auto_approve_confidence=hitl_cfg.get("auto_approve_confidence", 0.72),
+            auto_approve_max_lots=hitl_cfg.get("auto_approve_max_lots", 0.03),
+        )
+
+        # Broker / bar fetcher
+        if self.synthetic:
+            synth = SyntheticBroker()
+            self.broker      = synth
+            self.bar_fetcher = synth
+        else:
+            import os
+            from src.execution.broker_mt5 import MT5Broker
+
+            self.bar_fetcher = MT5BarFetcher(
+                symbol=self.cfg.get("broker", {}).get("symbol", "XAUUSD")
+            )
+            connected = self.bar_fetcher.connect(
+                login    = os.getenv("MT5_LOGIN",    ""),
+                password = os.getenv("MT5_PASSWORD", ""),
+                server   = os.getenv("MT5_SERVER",   ""),
+                path     = os.getenv("MT5_PATH"),
+            )
+            if not connected:
+                return False
+            self.broker = MT5Broker(
+                symbol=self.cfg.get("broker", {}).get("symbol", "XAUUSD"),
+                magic_number=self.cfg.get("broker", {}).get("magic_number", 20260509),
+            )
+            # MT5Broker reuses the already-initialised connection
+            self.broker._mt5 = self.bar_fetcher._mt5
+            self.broker._connected = True
+
+        # Telegram
+        self.alerter = TelegramAlerter()
+        if not self.synthetic:
+            self.alerter.alert_startup()
+
+        logger.info("All components initialised ✓")
+        return True
+
+    # ── run ───────────────────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        self.running = True
+        sig.signal(sig.SIGINT,  lambda s, f: setattr(self, "running", False))
+        sig.signal(sig.SIGTERM, lambda s, f: setattr(self, "running", False))
+
+        lot_size       = self.cfg.get("broker", {}).get("lot_size", 0.01)
+        bar_interval_s = 60   # M1 = 1 new bar per minute
+        last_bar_time  = 0
+
+        while self.running:
+            try:
+                # ── wait for a new M1 bar ──────────────────────────────────
+                bars = self.bar_fetcher.get_m1_bars(n=245)
+                if not bars or bars[-1]["time"] == last_bar_time:
+                    time.sleep(1)
+                    continue
+                last_bar_time = bars[-1]["time"]
+
+                # ── build features ─────────────────────────────────────────
+                features = build_features(bars)
+                if features is None:
+                    logger.debug(f"Not enough bars yet ({len(bars)}/240)")
+                    time.sleep(bar_interval_s)
+                    continue
+
+                # ── supervised inference ───────────────────────────────────
+                t_inf_start = time.perf_counter()
+                probs, conf, sup_lat = run_supervised(self.sup_model, features)
+                inf_lat_ms = (time.perf_counter() - t_inf_start) * 1000
+
+                # ── circuit breaker ────────────────────────────────────────
+                can_trade, block_reason = self.circuit_breaker.check_can_trade(inf_lat_ms)
+                if not can_trade:
+                    logger.warning(f"CircuitBreaker: {block_reason}")
+                    time.sleep(bar_interval_s)
+                    continue
+
+                # ── regime deploy gate ─────────────────────────────────────
+                deploy_cfg  = self.cfg.get("deploy_gate", {})
+                gate_enabled = deploy_cfg.get("enabled", True)
+                gmm2, vol_enc = get_regime(bars, deploy_cfg.get("regime_lookback_bars", 60))
+                gated = gate_enabled and (gmm2 == 0.0 and vol_enc == 1.0)
+                if gated:
+                    logger.info("DeployGate: Bear+HIGH — skipping bar")
+                    time.sleep(bar_interval_s)
+                    continue
+
+                # ── build RL obs ───────────────────────────────────────────
+                closes     = np.array([b["close"] for b in bars])
+                ret_1h     = mtf_return_zscored(closes, window=60)
+                ret_15m    = mtf_return_zscored(closes, window=15)
+                atr_n      = _atr_norm(bars)
+                trend_n    = _trend_norm(bars)
+                session_ph = _session_phase(bars)
+
+                pos_dir     = 0.0
+                unreal_pnl  = 0.0
+                hold_frac   = 0.0
+                if self.position is not None:
+                    pos_dir    = float(self.position["dir"])
+                    cur_price  = bars[-1]["close"]
+                    unreal_pnl = (cur_price - self.position["entry_price"]) \
+                                 * self.position["dir"] * 100.0  # approx $
+                    hold_frac  = min(1.0, self.hold_bars / self.max_hold)
+
+                rl_obs = build_rl_obs(
+                    probs=probs, confidence=conf,
+                    position_dir=pos_dir, unrealized_pnl=unreal_pnl,
+                    hold_frac=hold_frac,
+                    atr_norm=atr_n, trend_norm=trend_n,
+                    session_phase=session_ph,
+                    regime_quality=gmm2,
+                    gs_quartile=0.5,    # placeholder — not available live
+                    cu_au_regime=0.5,   # placeholder — not available live
+                    ret_1h=ret_1h, ret_15m=ret_15m,
+                )
+
+                # ── RL action ──────────────────────────────────────────────
+                size_signal, exit_signal, rl_lat = run_rl(self.rl_agent, rl_obs)
+                total_lat = sup_lat + rl_lat
+
+                # ── exit logic ─────────────────────────────────────────────
+                EXIT_THRESHOLD = -0.10
+                if self.position is not None:
+                    self.hold_bars += 1
+                    should_exit = (
+                        exit_signal < EXIT_THRESHOLD
+                        or self.hold_bars >= self.max_hold
+                    )
+                    if should_exit:
+                        exit_reason = "rl_exit" if exit_signal < EXIT_THRESHOLD \
+                                      else "max_hold"
+                        dc = DrawdownContext(
+                            consecutive_losses=self.circuit_breaker.state.consecutive_losses,
+                            daily_pnl_usd=self.circuit_breaker.state.daily_pnl,
+                        )
+                        ctx = SignalContext(
+                            action="CLOSE",
+                            confidence=conf,
+                            current_price=bars[-1]["close"],
+                            entry_price=self.position["entry_price"],
+                            unrealized_pnl=unreal_pnl,
+                            hold_time_bars=self.hold_bars,
+                            exit_reason=exit_reason,
+                            position_size_lots=self.position["lots"],
+                            drawdown_ctx=dc,
+                        )
+                        if self.hitl.check_exit(ctx):
+                            result = self.broker.close_position(
+                                self.position["ticket"], comment=exit_reason
+                            )
+                            if result.success:
+                                pnl = unreal_pnl
+                                self.circuit_breaker.record_trade(pnl)
+                                self.hitl.record_trade_result(pnl)
+                                self.alerter.alert_trade("CLOSE", result.price,
+                                                         self.position["lots"], pnl)
+                                self._write_log(
+                                    bars[-1], "CLOSE",
+                                    self.position["dir"], self.position["entry_price"],
+                                    result.price, self.position["lots"], pnl,
+                                    conf, size_signal, exit_signal, gmm2, vol_enc,
+                                    gated, probs,
+                                )
+                                logger.info(
+                                    f"CLOSED | PnL=${pnl:.2f} | reason={exit_reason}"
+                                )
+                                self.position  = None
+                                self.hold_bars = 0
+
+                # ── entry logic ────────────────────────────────────────────
+                ENTRY_CONF_GATE  = 0.70
+                ENTRY_SIZE_GATE  = 0.10   # |size_signal| must exceed this
+
+                if (self.position is None
+                        and conf >= ENTRY_CONF_GATE
+                        and abs(size_signal) >= ENTRY_SIZE_GATE):
+
+                    sup_action = int(probs.argmax())  # 0=sell 1=hold 2=buy
+                    if sup_action == 1:
+                        # supervised says hold — skip
+                        pass
+                    else:
+                        direction = 1 if sup_action == 2 else -1  # +1=long -1=short
+                        lots      = self.circuit_breaker.get_position_size(lot_size)
+                        ctx = SignalContext(
+                            action="BUY" if direction == 1 else "SELL",
+                            confidence=conf,
+                            current_price=bars[-1]["close"],
+                            position_size_lots=lots,
+                            regime=f"{'Bull' if gmm2 else 'Bear'}-{'HIGH' if vol_enc else 'LOW'}",
+                        )
+                        if self.hitl.check_entry(ctx):
+                            if direction == 1:
+                                result = self.broker.buy(lots, comment="rl_entry")
+                            else:
+                                result = self.broker.sell(lots, comment="rl_entry")
+                            if result.success:
+                                self.position  = {
+                                    "dir":         direction,
+                                    "entry_price": result.price,
+                                    "lots":        lots,
+                                    "ticket":      result.ticket,
+                                }
+                                self.hold_bars = 0
+                                self._write_log(
+                                    bars[-1],
+                                    "BUY" if direction == 1 else "SELL",
+                                    direction, result.price, result.price,
+                                    lots, 0.0, conf, size_signal, exit_signal,
+                                    gmm2, vol_enc, gated, probs,
+                                )
+                                logger.info(
+                                    f"ENTRY {'LONG' if direction==1 else 'SHORT'} "
+                                    f"@ {result.price:.2f} | conf={conf:.3f} | "
+                                    f"rl_size={size_signal:.3f} | lat={total_lat:.1f}ms"
+                                )
+
+                # ── periodic log ───────────────────────────────────────────
+                pos_str = f"pos={'LONG' if self.position else 'FLAT'}"
+                logger.info(
+                    f"Bar {bars[-1]['time']} | {pos_str} | "
+                    f"probs=[{probs[0]:.3f},{probs[1]:.3f},{probs[2]:.3f}] "
+                    f"conf={conf:.3f} | rl=[{size_signal:.2f},{exit_signal:.2f}] "
+                    f"| gmm2={'Bear' if gmm2==0 else 'Bull'} vol={'HIGH' if vol_enc else 'LOW'}"
+                )
+
+                # Wait for next bar (skip if synthetic/fast mode)
+                if not self.synthetic:
+                    time.sleep(max(1, bar_interval_s - 5))
+
+            except Exception as e:
+                logger.error(f"Loop error: {e}", exc_info=True)
+                time.sleep(5)
+
+        logger.info(f"Shutdown | HITL stats: {self.hitl.stats}")
+        self._log_file.close()
+        if not self.synthetic:
+            self.alerter.alert_shutdown()
+
+    def _write_log(self, bar, action, direction, entry_price, close_price,
+                   lots, pnl, conf, rl_size, rl_exit, gmm2, vol_enc,
+                   gated, probs):
+        self._log.writerow([
+            datetime.now(timezone.utc).isoformat(),
+            bar["time"], action, direction,
+            round(entry_price, 3), round(close_price, 3),
+            lots, round(pnl, 4),
+            round(conf, 4), round(rl_size, 4), round(rl_exit, 4),
+            gmm2, vol_enc, gated,
+            round(probs[0], 4), round(probs[1], 4), round(probs[2], 4),
+        ])
+        self._log_file.flush()
+
+
+# ── entrypoint ────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/deployment/production.yaml")
-    parser.add_argument("--synthetic", action="store_true")
+    parser = argparse.ArgumentParser(description="HFTExperiment v2 — Phase 8b paper trader")
+    parser.add_argument("--config",    default="configs/deployment/production.yaml")
+    parser.add_argument("--synthetic", action="store_true",
+                        help="Run with synthetic price feed (no MT5 required)")
     args = parser.parse_args()
 
     setup_logger()
