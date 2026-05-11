@@ -146,13 +146,19 @@ class HITLGate:
         auto_approve_loss_streak_cap: int = 3,    # PATCH: review profits during streaks
         show_technicals: bool = False,
         approval_fn: Optional[Callable[[SignalContext], bool]] = None,
+        telegram_hitl: "TelegramHITL | None" = None,   # Phase 8b: Telegram approval
     ):
         self.enabled = enabled
         self.auto_approve_confidence = auto_approve_confidence
         self.auto_approve_max_lots = auto_approve_max_lots
         self.auto_approve_loss_streak_cap = auto_approve_loss_streak_cap
         self.show_technicals = show_technicals
-        self._approval_fn = approval_fn or self._console_approval
+        self._telegram = telegram_hitl
+        # If TelegramHITL provided, use it instead of console
+        if telegram_hitl is not None:
+            self._approval_fn = telegram_hitl.request_approval
+        else:
+            self._approval_fn = approval_fn or self._console_approval
 
         self.stats = {
             "approved": 0, "vetoed": 0, "auto_approved": 0, "total_prompted": 0,
@@ -269,6 +275,161 @@ class HITLGate:
                 self.enabled = False
                 print("  → Auto-approving all remaining")
                 return True
+
+
+class TelegramHITL:
+    """Telegram-based approval gate.
+
+    Sends a signal card to your Telegram chat when a trade needs approval.
+    Polls for /approve or /veto reply (or inline button) for up to `timeout_s`.
+    Falls back to auto-approve if no reply within timeout.
+
+    Setup:
+        1. Create a bot via @BotFather → get TELEGRAM_BOT_TOKEN
+        2. Send /start to your bot → get TELEGRAM_CHAT_ID via getUpdates
+        3. Set env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+    Commands (reply to bot):
+        /approve  or  /y  → approve the trade
+        /veto     or  /n  → reject the trade
+        /skip            → auto-approve everything for this session
+    """
+
+    def __init__(
+        self,
+        bot_token: str | None = None,
+        chat_id: str | None = None,
+        timeout_s: int = 120,            # wait up to 2 min before auto-approve
+        auto_approve_on_timeout: bool = True,
+    ):
+        import os
+        self.bot_token  = bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
+        self.chat_id    = chat_id   or os.getenv("TELEGRAM_CHAT_ID", "")
+        self.timeout_s  = timeout_s
+        self.auto_approve_on_timeout = auto_approve_on_timeout
+        self._enabled   = bool(self.bot_token and self.chat_id)
+        self._skip_all  = False      # set True when user sends /skip
+        self._last_update_id = 0     # Telegram getUpdates offset
+
+        if not self._enabled:
+            logger.warning("TelegramHITL: no token/chat_id — falling back to console")
+
+    def request_approval(self, ctx: "SignalContext") -> bool:
+        """Send card to Telegram, poll for reply. Returns True=approve."""
+        if self._skip_all:
+            return True
+        if not self._enabled:
+            return self._console_fallback(ctx)
+        try:
+            msg = self._format_card(ctx)
+            self._send_message(msg, parse_mode="Markdown")
+            return self._poll_reply()
+        except Exception as e:
+            logger.error(f"TelegramHITL error: {e} — auto-approving")
+            return True
+
+    def _format_card(self, ctx: "SignalContext") -> str:
+        is_exit = "CLOSE" in ctx.action or ctx.entry_price > 0
+        conf_filled = int(ctx.confidence * 10)
+        conf_bar    = "█" * conf_filled + "░" * (10 - conf_filled)
+
+        if is_exit:
+            pnl_sign = "+" if ctx.unrealized_pnl >= 0 else ""
+            emoji    = "💰" if ctx.unrealized_pnl >= 0 else "📉"
+            card = (
+                f"{emoji} *EXIT SIGNAL*\n"
+                f"PnL: `{pnl_sign}${ctx.unrealized_pnl:.2f}` "
+                f"({pnl_sign}{ctx.pips_from_entry:.0f} pips)\n"
+                f"Entry: `{ctx.entry_price:.2f}` → Now: `{ctx.current_price:.2f}`\n"
+                f"Hold: {ctx.hold_time_bars} bars | Lots: {ctx.position_size_lots}\n"
+                f"Reason: `{ctx.exit_reason}`\n"
+            )
+        else:
+            emoji = "📈" if ctx.action == "BUY" else "📉"
+            card = (
+                f"{emoji} *{ctx.action} SIGNAL*\n"
+                f"Price: `{ctx.current_price:.2f}` | Lots: `{ctx.position_size_lots}`\n"
+            )
+
+        card += (
+            f"Conf: `[{conf_bar}] {ctx.confidence:.1%}`\n"
+            f">> _{ctx.recommendation}_\n\n"
+            f"Reply: /approve ✅  or  /veto ❌  or  /skip ⏭\n"
+            f"_(auto-approve in {self.timeout_s}s if no reply)_"
+        )
+        return card
+
+    def _send_message(self, text: str, parse_mode: str = "Markdown") -> dict:
+        import requests
+        url  = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        resp = requests.post(url, json={
+            "chat_id":    self.chat_id,
+            "text":       text,
+            "parse_mode": parse_mode,
+        }, timeout=5)
+        return resp.json()
+
+    def _poll_reply(self) -> bool:
+        """Poll getUpdates for /approve, /veto or /skip. Returns True=approve."""
+        import requests, time
+        url      = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+        deadline = time.time() + self.timeout_s
+        approve_cmds = {"/approve", "/y", "approve", "y", "yes"}
+        veto_cmds    = {"/veto",    "/n", "veto",    "n", "no"}
+        skip_cmds    = {"/skip", "skip", "s"}
+
+        while time.time() < deadline:
+            try:
+                resp = requests.get(url, params={
+                    "offset":  self._last_update_id + 1,
+                    "timeout": 5,
+                }, timeout=10).json()
+                for update in resp.get("result", []):
+                    self._last_update_id = max(self._last_update_id,
+                                               update["update_id"])
+                    text = (
+                        update.get("message", {}).get("text", "")
+                        or update.get("callback_query", {}).get("data", "")
+                    ).strip().lower()
+                    # Only accept replies from our chat
+                    from_chat = (
+                        str(update.get("message", {}).get("chat", {}).get("id", ""))
+                        or str(update.get("callback_query", {}).get("message", {})
+                               .get("chat", {}).get("id", ""))
+                    )
+                    if from_chat != str(self.chat_id):
+                        continue
+                    if text in approve_cmds:
+                        logger.info("TelegramHITL: APPROVED via Telegram")
+                        self._send_message("✅ Trade APPROVED")
+                        return True
+                    if text in veto_cmds:
+                        logger.info("TelegramHITL: VETOED via Telegram")
+                        self._send_message("❌ Trade VETOED")
+                        return False
+                    if text in skip_cmds:
+                        logger.info("TelegramHITL: SKIP ALL via Telegram")
+                        self._send_message("⏭ Auto-approving all remaining signals")
+                        self._skip_all = True
+                        return True
+            except Exception as e:
+                logger.warning(f"TelegramHITL poll error: {e}")
+                time.sleep(2)
+            time.sleep(1)
+
+        logger.info(f"TelegramHITL: timeout ({self.timeout_s}s) — "
+                    f"{'auto-approving' if self.auto_approve_on_timeout else 'vetoing'}")
+        msg = "⏰ Timeout — " + ("trade AUTO-APPROVED" if self.auto_approve_on_timeout
+                                 else "trade VETOED (timeout)")
+        self._send_message(msg)
+        return self.auto_approve_on_timeout
+
+    @staticmethod
+    def _console_fallback(ctx: "SignalContext") -> bool:
+        """Use if Telegram not configured."""
+        print(f"\nApprove {ctx.action} @ {ctx.current_price:.2f} "
+              f"conf={ctx.confidence:.2%}? (y/n): ", end="", flush=True)
+        return input().strip().lower() in ("y", "yes", "")
 
 
 class RiskDisplay:

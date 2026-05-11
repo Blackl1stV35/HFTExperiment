@@ -31,17 +31,31 @@ risk:
   max_daily_drawdown_pct: 2.0  # halt if daily loss > 2% of account
   max_consecutive_losses: 5    # reduce size after 5 consecutive losses
   loss_reduction_factor: 0.5   # halve position size when streak active
-  latency_kill_ms: 500.0        # skip bar if inference > 500ms
+  latency_kill_ms: 50.0        # skip bar if inference > 50ms
   max_hold_bars: 80            # force close after 80 bars (~80 min on M1)
   news_blackout_minutes: 30    # no trading 30 min around FOMC/NFP/CPI
 
 # ── HITL ──────────────────────────────────────────────────────────────────────
-# Human-in-the-loop approval gate (console prompt on Windows terminal)
+# Telegram-based approval gate — approve trades from your phone.
+# Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env file.
+#
+# How to get credentials:
+#   1. Message @BotFather on Telegram → /newbot → copy token
+#   2. Message your bot → visit:
+#      https://api.telegram.org/bot<TOKEN>/getUpdates
+#      → find "chat":{"id": XXXXXX} → that is your CHAT_ID
+#
+# Commands to send in Telegram chat:
+#   /approve  (or y)  → execute the trade
+#   /veto     (or n)  → reject the trade
+#   /skip            → auto-approve all remaining this session
 hitl:
   enabled: true
-  auto_approve_confidence: 0.72   # entries above 72% confidence auto-approve
-  auto_approve_max_lots: 0.03     # auto-approve if lots <= 0.03
-  # Auto-approves profitable exits except during consecutive-loss streaks >= 3
+  telegram_approval: true          # use Telegram instead of terminal prompt
+  telegram_timeout_s: 120          # auto-approve after 2 min if no reply
+  auto_approve_on_timeout: true    # True=approve, False=veto on timeout
+  auto_approve_confidence: 0.72    # entries above 72% confidence auto-approve
+  auto_approve_max_lots: 0.03      # auto-approve if lots <= 0.03
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging:

@@ -456,11 +456,25 @@ class TradingLoop:
             account_balance=acct_info["balance"],
         )
 
-        # HITL
+        # HITL — use Telegram approval when not in synthetic mode
+        from src.hitl.mt5_interface import TelegramHITL
+        tg_hitl = None
+        if not self.synthetic and hitl_cfg.get("telegram_approval", True):
+            tg_hitl = TelegramHITL(
+                timeout_s=hitl_cfg.get("telegram_timeout_s", 120),
+                auto_approve_on_timeout=hitl_cfg.get("auto_approve_on_timeout", True),
+            )
+            if tg_hitl._enabled:
+                logger.info(f"TelegramHITL enabled — timeout={tg_hitl.timeout_s}s")
+            else:
+                logger.warning("TelegramHITL: env vars not set — falling back to console")
+                tg_hitl = None
+
         self.hitl = HITLGate(
             enabled=hitl_cfg.get("enabled", True) and not self.synthetic,
             auto_approve_confidence=hitl_cfg.get("auto_approve_confidence", 0.72),
             auto_approve_max_lots=hitl_cfg.get("auto_approve_max_lots", 0.03),
+            telegram_hitl=tg_hitl,
         )
 
         # Broker / bar fetcher
