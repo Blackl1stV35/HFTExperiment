@@ -162,7 +162,11 @@ def get_regime(bars: list[dict], lookback: int = 60) -> tuple[float, float]:
     base   = bars[-lookback:-15]
     atr_recent   = np.mean([b["high"] - b["low"] for b in recent])
     atr_baseline = np.mean([b["high"] - b["low"] for b in base]) + 1e-8
-    vol_enc = 1.0 if atr_recent > atr_baseline * 1.4 else 0.0
+    # Phase 4 exploration: d_ATR directional gate (P1 Ma et al 2021, KS=0.149 STRONG)
+    # Only block Bear+HIGH when ATR is ACTIVELY RISING (46% of Bear+HIGH bars
+    # are falling-ATR recovery; blocking them unnecessarily reduces trade opportunities).
+    atr_rising = atr_recent > atr_baseline   # volatility expanding vs contracting
+    vol_enc = 1.0 if (atr_recent > atr_baseline * 1.4 and atr_rising) else 0.0
 
     return gmm2, vol_enc
 

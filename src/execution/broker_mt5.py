@@ -104,7 +104,7 @@ class MT5Broker:
             comment=comment,
         )
 
-    def close_position(self, ticket: int) -> OrderResult:
+    def close_position(self, ticket: int, comment: str = "close") -> OrderResult:
         """Close an open position by ticket."""
         if not self._connected:
             return OrderResult(success=False, comment="Not connected")
@@ -138,7 +138,7 @@ class MT5Broker:
             "price": close_price,
             "deviation": self.max_slippage,
             "magic": self.magic_number,
-            "comment": "close",
+            "comment": comment,
             "type_filling": filling_type,
         }
 
@@ -174,7 +174,7 @@ class MT5Broker:
             price = tick.ask
         else:
             order_type = mt5.ORDER_TYPE_SELL
-            price = tick.bid
+            price = tick.bids
 
         # Auto-detect filling mode supported by this broker/symbol.
         # HF Markets demo uses RETURN; some brokers use FOK or IOC.

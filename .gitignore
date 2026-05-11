@@ -24,6 +24,7 @@ outputs/
 multirun/
 .DS_Store
 *.ipynb_checkpoints/
+notebooks/*.png
 rust_inference/target/
 
 # note: commit after finishing training pipelines
