@@ -432,6 +432,241 @@ class TelegramHITL:
         return input().strip().lower() in ("y", "yes", "")
 
 
+class TelegramCommander:
+    """Full remote control of the trading bot via Telegram commands.
+
+    Send commands to your bot from your phone to control the running process.
+
+    Commands:
+        /start          Resume trading (un-pause)
+        /stop           Pause new entries (holds existing positions)
+        /kill           Emergency stop — close all positions and exit process
+        /close          Close current position immediately
+        /status         Show current position, PnL, regime, last signal
+        /config         Show current config (lot size, gate, thresholds)
+        /setlot <n>     Change lot size (e.g. /setlot 0.02)
+        /setconf <n>    Change confidence gate (e.g. /setconf 0.75)
+        /gate on|off    Enable/disable Bear+HIGH deploy gate
+        /autoapprove    Auto-approve all trades for this session
+        /help           Show this list
+
+    Usage in paper_trade.py:
+        commander = TelegramCommander(state=self)   # pass TradingLoop as state
+        threading.Thread(target=commander.listen, daemon=True).start()
+    """
+
+    def __init__(self, state, bot_token: str | None = None, chat_id: str | None = None):
+        import os
+        self.state      = state          # reference to TradingLoop instance
+        self.bot_token  = bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
+        self.chat_id    = chat_id   or os.getenv("TELEGRAM_CHAT_ID", "")
+        self._enabled   = bool(self.bot_token and self.chat_id)
+        self._offset    = 0
+        self._running   = False
+
+        if not self._enabled:
+            logger.warning("TelegramCommander: env vars not set — remote control disabled")
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    def listen(self) -> None:
+        """Blocking loop — run in a daemon thread."""
+        if not self._enabled:
+            return
+        self._running = True
+        self.send("🤖 *Commander online*\n" + self._help_text())
+        logger.info("TelegramCommander: listening for commands")
+        import time
+        while self._running:
+            try:
+                self._poll_commands()
+            except Exception as e:
+                logger.warning(f"TelegramCommander poll error: {e}")
+            time.sleep(1)
+
+    def send(self, text: str) -> None:
+        if not self._enabled:
+            return
+        try:
+            import requests
+            requests.post(
+                f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
+                json={"chat_id": self.chat_id, "text": text,
+                      "parse_mode": "Markdown"},
+                timeout=5,
+            )
+        except Exception as e:
+            logger.warning(f"TelegramCommander send error: {e}")
+
+    # ── private ───────────────────────────────────────────────────────────────
+
+    def _poll_commands(self) -> None:
+        import requests
+        resp = requests.get(
+            f"https://api.telegram.org/bot{self.bot_token}/getUpdates",
+            params={"offset": self._offset + 1, "timeout": 3},
+            timeout=8,
+        ).json()
+        for update in resp.get("result", []):
+            self._offset = max(self._offset, update["update_id"])
+            msg  = update.get("message", {})
+            text = msg.get("text", "").strip()
+            from_chat = str(msg.get("chat", {}).get("id", ""))
+            if from_chat != str(self.chat_id) or not text.startswith("/"):
+                continue
+            self._handle(text)
+
+    def _handle(self, text: str) -> None:
+        s    = self.state
+        cmd  = text.split()[0].lower()
+        args = text.split()[1:]
+
+        if cmd == "/help":
+            self.send(self._help_text())
+
+        elif cmd == "/status":
+            self.send(self._status_text())
+
+        elif cmd == "/start":
+            s._paused = False
+            self.send("▶️ *Trading RESUMED* — new entries enabled")
+            logger.info("TelegramCommander: RESUMED")
+
+        elif cmd == "/stop":
+            s._paused = True
+            self.send("⏸ *Trading PAUSED* — holding existing positions, no new entries")
+            logger.info("TelegramCommander: PAUSED")
+
+        elif cmd == "/kill":
+            self.send("🔴 *KILL received* — closing all positions and shutting down...")
+            logger.warning("TelegramCommander: KILL command received")
+            self._emergency_close_all()
+            s.running = False
+
+        elif cmd == "/close":
+            if s.position is not None:
+                self.send("🔒 Closing current position...")
+                s._force_close = True
+            else:
+                self.send("ℹ️ No open position to close")
+
+        elif cmd == "/config":
+            self.send(self._config_text())
+
+        elif cmd == "/setlot":
+            if args:
+                try:
+                    v = float(args[0])
+                    if 0.001 <= v <= 10.0:
+                        s.cfg["broker"]["lot_size"] = v
+                        self.send(f"✅ Lot size set to `{v}`")
+                    else:
+                        self.send("❌ Lot size must be between 0.001 and 10.0")
+                except ValueError:
+                    self.send("❌ Usage: /setlot 0.02")
+
+        elif cmd == "/setconf":
+            if args:
+                try:
+                    v = float(args[0])
+                    if 0.5 <= v <= 0.99:
+                        s.hitl.auto_approve_confidence = v
+                        self.send(f"✅ Confidence gate set to `{v:.2f}` ({v:.0%})")
+                    else:
+                        self.send("❌ Confidence must be between 0.50 and 0.99")
+                except ValueError:
+                    self.send("❌ Usage: /setconf 0.75")
+
+        elif cmd == "/gate":
+            if args:
+                on = args[0].lower() in ("on", "true", "1", "yes")
+                s.cfg.setdefault("deploy_gate", {})["enabled"] = on
+                self.send(f"✅ Deploy gate: {'ON (Bear+HIGH blocked)' if on else 'OFF (all regimes trade)'}")
+            else:
+                self.send("❌ Usage: /gate on  or  /gate off")
+
+        elif cmd == "/autoapprove":
+            if s.hitl._telegram:
+                s.hitl._telegram._skip_all = True
+            s.hitl.enabled = False
+            self.send("⏭ *Auto-approving all* — HITL disabled for this session")
+
+        else:
+            self.send(f"❓ Unknown command: `{cmd}`\nSend /help for command list")
+
+    def _emergency_close_all(self) -> None:
+        """Close all open positions via broker."""
+        try:
+            positions = self.state.broker.get_open_positions()
+            if not positions:
+                self.send("ℹ️ No open positions to close")
+                return
+            for p in positions:
+                result = self.state.broker.close_position(p["ticket"], comment="kill")
+                if result.success:
+                    self.send(f"✅ Closed ticket {p['ticket']} @ {result.price:.2f}")
+                else:
+                    self.send(f"❌ Failed to close {p['ticket']}: {result.comment}")
+            self.state.position  = None
+            self.state.hold_bars = 0
+        except Exception as e:
+            self.send(f"❌ Emergency close error: {e}")
+
+    def _status_text(self) -> str:
+        s = self.state
+        pos_str = "FLAT"
+        if s.position is not None:
+            dir_str = "LONG" if s.position["dir"] == 1 else "SHORT"
+            pos_str = (
+                f"{dir_str} {s.position['lots']} lots @ {s.position['entry_price']:.2f}\n"
+                f"  Hold: {s.hold_bars} bars | Ticket: {s.position['ticket']}"
+            )
+        paused  = getattr(s, "_paused", False)
+        gate_on = s.cfg.get("deploy_gate", {}).get("enabled", True)
+        acct    = s.broker.get_account_info() if s.broker else {}
+
+        return (
+            f"📊 *Status*\n"
+            f"Position: `{pos_str}`\n"
+            f"Trading: {'⏸ PAUSED' if paused else '▶️ ACTIVE'}\n"
+            f"Deploy gate: {'ON' if gate_on else 'OFF'}\n"
+            f"Lot size: `{s.cfg.get('broker', {}).get('lot_size', 0.01)}`\n"
+            f"Conf gate: `{s.hitl.auto_approve_confidence:.0%}`\n"
+            f"Balance: `${acct.get('balance', 0):.2f}` | "
+            f"Equity: `${acct.get('equity', 0):.2f}`"
+        )
+
+    def _config_text(self) -> str:
+        s = self.state
+        return (
+            f"⚙️ *Config*\n"
+            f"Symbol: `{s.cfg.get('broker', {}).get('symbol', 'XAUUSD')}`\n"
+            f"Lot size: `{s.cfg.get('broker', {}).get('lot_size', 0.01)}`\n"
+            f"Max hold: `{s.cfg.get('risk', {}).get('max_hold_bars', 80)} bars`\n"
+            f"Conf gate: `{s.hitl.auto_approve_confidence:.0%}`\n"
+            f"Deploy gate: `{s.cfg.get('deploy_gate', {}).get('enabled', True)}`\n"
+            f"Latency kill: `{s.cfg.get('risk', {}).get('latency_kill_ms', 500)}ms`\n"
+            f"Mode: `{'SYNTHETIC' if s.synthetic else 'LIVE MT5'}`"
+        )
+
+    @staticmethod
+    def _help_text() -> str:
+        return (
+            "🤖 *HFT Bot Commands*\n\n"
+            "`/status`       — position, PnL, regime\n"
+            "`/start`        — resume trading\n"
+            "`/stop`         — pause new entries\n"
+            "`/kill`         — close all + shutdown\n"
+            "`/close`        — close current position\n"
+            "`/config`       — show current settings\n"
+            "`/setlot 0.02`  — change lot size\n"
+            "`/setconf 0.75` — change confidence gate\n"
+            "`/gate on|off`  — enable/disable Bear+HIGH gate\n"
+            "`/autoapprove`  — disable HITL for session\n"
+            "`/help`         — show this list"
+        )
+
+
 class RiskDisplay:
     """Compact signal display for periodic logging."""
 

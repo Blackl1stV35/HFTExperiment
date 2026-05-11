@@ -404,8 +404,10 @@ class TradingLoop:
 
         # Position state
         self.position: dict | None = None  # {dir, entry_price, lots, ticket, hold_bars}
-        self.hold_bars = 0
-        self.max_hold  = self.cfg.get("risk", {}).get("max_hold_bars", 80)
+        self.hold_bars  = 0
+        self.max_hold   = self.cfg.get("risk", {}).get("max_hold_bars", 80)
+        self._paused     = False   # set True by /stop command
+        self._force_close = False  # set True by /close command
 
         # Paper trade log
         log_path = Path(self.cfg.get("logging", {}).get("trade_log",
@@ -510,6 +512,17 @@ class TradingLoop:
         if not self.synthetic:
             self.alerter.alert_startup()
 
+        # Start Telegram commander in background thread
+        import threading
+        from src.hitl.mt5_interface import TelegramCommander
+        self.commander = TelegramCommander(state=self)
+        if self.commander._enabled and not self.synthetic:
+            t = threading.Thread(target=self.commander.listen, daemon=True)
+            t.start()
+            logger.info("TelegramCommander: started in background thread")
+        else:
+            self.commander = None
+
         logger.info("All components initialised ✓")
         return True
 
@@ -532,6 +545,29 @@ class TradingLoop:
                     time.sleep(1)
                     continue
                 last_bar_time = bars[-1]["time"]
+
+                # ── remote control checks ─────────────────────────────────
+                if self._force_close and self.position is not None:
+                    logger.info("TelegramCommander: force-closing position")
+                    result = self.broker.close_position(
+                        self.position["ticket"], comment="telegram_close"
+                    )
+                    if result.success:
+                        pnl = (result.price - self.position["entry_price"])                               * self.position["dir"] * self.position["lots"] * 100.0
+                        self.circuit_breaker.record_trade(pnl)
+                        if self.commander:
+                            self.commander.send(
+                                f"✅ Force closed @ `{result.price:.2f}` | PnL: `${pnl:.2f}`"
+                            )
+                    self.position    = None
+                    self.hold_bars   = 0
+                    self._force_close = False
+
+                if self._paused:
+                    if self.commander:
+                        pass  # status logged per bar only if changed
+                    time.sleep(bar_interval_s if not self.synthetic else 0.2)
+                    continue
 
                 # ── build features ─────────────────────────────────────────
                 features = build_features(bars)
@@ -691,11 +727,19 @@ class TradingLoop:
                                     lots, 0.0, conf, size_signal, exit_signal,
                                     gmm2, vol_enc, gated, probs,
                                 )
+                                dir_str = "LONG" if direction == 1 else "SHORT"
                                 logger.info(
-                                    f"ENTRY {'LONG' if direction==1 else 'SHORT'} "
+                                    f"ENTRY {dir_str} "
                                     f"@ {result.price:.2f} | conf={conf:.3f} | "
                                     f"rl_size={size_signal:.3f} | lat={total_lat:.1f}ms"
                                 )
+                                if self.commander:
+                                    self.commander.send(
+                                        f"✅ *ENTRY {dir_str}* @ `{result.price:.2f}`\n"
+                                        f"Lots: `{lots}` | Conf: `{conf:.1%}` | "
+                                        f"Regime: `{'Bull' if gmm2 else 'Bear'}-"
+                                        f"{'HIGH' if vol_enc else 'LOW'}`"
+                                    )
 
                 # ── periodic log ───────────────────────────────────────────
                 pos_str = f"pos={'LONG' if self.position else 'FLAT'}"

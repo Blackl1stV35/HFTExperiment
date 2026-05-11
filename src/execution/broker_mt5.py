@@ -121,6 +121,14 @@ class MT5Broker:
         price = mt5.symbol_info_tick(self.symbol)
         close_price = price.bid if close_type == mt5.ORDER_TYPE_SELL else price.ask
 
+        info = mt5.symbol_info(self.symbol)
+        filling_type = mt5.ORDER_FILLING_RETURN
+        if info is not None:
+            filling_mask = info.filling_mode
+            if filling_mask & 1: filling_type = mt5.ORDER_FILLING_FOK
+            if filling_mask & 2: filling_type = mt5.ORDER_FILLING_IOC
+            if filling_mask & 4: filling_type = mt5.ORDER_FILLING_RETURN
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": self.symbol,
@@ -131,6 +139,7 @@ class MT5Broker:
             "deviation": self.max_slippage,
             "magic": self.magic_number,
             "comment": "close",
+            "type_filling": filling_type,
         }
 
         start = time.perf_counter()
@@ -167,6 +176,20 @@ class MT5Broker:
             order_type = mt5.ORDER_TYPE_SELL
             price = tick.bid
 
+        # Auto-detect filling mode supported by this broker/symbol.
+        # HF Markets demo uses RETURN; some brokers use FOK or IOC.
+        # Try each in order: RETURN → IOC → FOK.
+        info = mt5.symbol_info(self.symbol)
+        filling_type = mt5.ORDER_FILLING_RETURN  # default
+        if info is not None:
+            filling_mask = info.filling_mode
+            if filling_mask & 1:    # ORDER_FILLING_FOK = 1
+                filling_type = mt5.ORDER_FILLING_FOK
+            if filling_mask & 2:    # ORDER_FILLING_IOC = 2
+                filling_type = mt5.ORDER_FILLING_IOC
+            if filling_mask & 4:    # ORDER_FILLING_RETURN = 4
+                filling_type = mt5.ORDER_FILLING_RETURN
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": self.symbol,
@@ -176,7 +199,7 @@ class MT5Broker:
             "deviation": self.max_slippage,
             "magic": self.magic_number,
             "comment": comment or f"NN_{action_type}",
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": filling_type,
         }
 
         start = time.perf_counter()
