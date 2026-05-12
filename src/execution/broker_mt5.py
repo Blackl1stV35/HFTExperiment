@@ -72,7 +72,10 @@ class MT5Broker:
             return False
 
     def get_tick(self) -> Optional[dict]:
-        """Get current bid/ask tick."""
+        """Get current bid/ask tick.
+        Defensive accessor handles different MT5 Python API versions.
+        Some versions expose .bid/.ask directly; others wrap in arrays.
+        """
         if not self._connected:
             return None
 
@@ -80,13 +83,25 @@ class MT5Broker:
         if tick is None:
             return None
 
-        return {
-            "bid": tick.bid,
-            "ask": tick.ask,
-            "last": tick.last,
-            "time": tick.time,
-            "spread": round((tick.ask - tick.bid) / 0.01),
-        }
+        # Defensive: handle both attribute styles and array-wrapped versions
+        def _get(obj, *names):
+            for name in names:
+                try:
+                    v = getattr(obj, name, None)
+                    if v is not None:
+                        # Some MT5 versions return arrays for bid/ask
+                        return float(v[0]) if hasattr(v, "__len__") else float(v)
+                except Exception:
+                    pass
+            return 0.0
+
+        bid  = _get(tick, "bid",  "bids",  "Bid")
+        ask  = _get(tick, "ask",  "asks",  "Ask")
+        last = _get(tick, "last", "Last",  "price")
+        time_ = getattr(tick, "time", 0)
+
+        spread = round((ask - bid) / 0.01) if ask > bid else 0
+        return {"bid": bid, "ask": ask, "last": last, "time": time_, "spread": spread}
 
     def buy(self, volume: float, comment: str = "") -> OrderResult:
         """Execute a market buy order."""
@@ -118,8 +133,20 @@ class MT5Broker:
 
         position = positions[0]
         close_type = mt5.ORDER_TYPE_SELL if position.type == 0 else mt5.ORDER_TYPE_BUY
-        price = mt5.symbol_info_tick(self.symbol)
-        close_price = price.bid if close_type == mt5.ORDER_TYPE_SELL else price.ask
+        _ptick = mt5.symbol_info_tick(self.symbol)
+        def _tp(t, *names):
+            for n in names:
+                try:
+                    v = getattr(t, n, None)
+                    if v is not None:
+                        return float(v[0]) if hasattr(v, "__len__") else float(v)
+                except Exception:
+                    pass
+            return 0.0
+        if close_type == mt5.ORDER_TYPE_SELL:
+            close_price = _tp(_ptick, "bid", "bids", "Bid")
+        else:
+            close_price = _tp(_ptick, "ask", "asks", "Ask")
 
         info = mt5.symbol_info(self.symbol)
         filling_type = mt5.ORDER_FILLING_RETURN
@@ -174,7 +201,7 @@ class MT5Broker:
             price = tick.ask
         else:
             order_type = mt5.ORDER_TYPE_SELL
-            price = tick.bids
+            price = tick.bid
 
         # Auto-detect filling mode supported by this broker/symbol.
         # HF Markets demo uses RETURN; some brokers use FOK or IOC.
