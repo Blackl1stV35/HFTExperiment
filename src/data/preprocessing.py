@@ -128,30 +128,73 @@ def get_scaler(method: str, window_size: int):
 
 # ── OHLCV feature preparation ─────────────────────────────────────────────────
 
-def _compute_rq(df) -> np.ndarray:
-    """Extract regime quality (rq) from the dataframe or return zeros.
+def _compute_rq(df, existing_npz_path: str | None = None) -> np.ndarray:
+    """Extract regime quality (rq) from available sources.
 
-    rq is computed by the GMM2 regime model during data ingestion and stored
-    in the NPZ. If available in df, extract directly; otherwise return 0.5.
-    Range [0, 0.92]. Higher = more confident regime assignment.
+    Priority:
+    1. df column 'regime_quality_norm' or 'rq' — from join_regime_labels()
+    2. existing_npz_path — copy rq from previous training_ready.npz (same bars)
+    3. Inline proxy: rolling 5-day std of (gmm2 * vol_enc) as regime stability
+    4. Constant 0.5 fallback
 
     Phase 4 exploration: KS=0.623 STRONG, MI=0.198 (21x OHLCV), ratio=0.60 PASS.
     Strongest supervised addition found across all exploration phases.
+    Range [0, 0.92]. Higher = more confident regime assignment.
     """
+    import warnings
+    n = len(df)
+
+    # Priority 1: from df (populated by join_regime_labels if regime CSV has rq)
     try:
-        if "rq" in df.columns:
-            return df["rq"].to_numpy().astype(np.float32)
-        elif "regime_quality" in df.columns:
-            return df["regime_quality"].to_numpy().astype(np.float32)
-        else:
-            # rq not in raw CSV — will be 0.5 placeholder
-            # The NPZ rebuild pipeline should join rq from regime labels CSV
-            import warnings
-            warnings.warn("rq column not found in df — using 0.5 placeholder. "
-                          "Join regime labels before NPZ rebuild for correct rq values.")
-            return np.full(len(df), 0.5, dtype=np.float32)
+        for col in ("regime_quality_norm", "rq", "regime_quality"):
+            if col in df.columns:
+                vals = df[col].to_numpy().astype(np.float32)
+                if vals.std() > 0.01:   # not all-constant placeholder
+                    return vals
     except Exception:
-        return np.full(len(df), 0.5, dtype=np.float32)
+        pass
+
+    # Priority 2: copy from existing NPZ (same bar count required)
+    if existing_npz_path is not None:
+        try:
+            old_d = np.load(existing_npz_path, allow_pickle=True)
+            if "rq" in old_d and len(old_d["rq"]) == n:
+                vals = old_d["rq"].astype(np.float32)
+                if vals.std() > 0.01:
+                    import logging; logging.getLogger(__name__).info(
+                        f"rq: loaded from existing NPZ {existing_npz_path}")
+                    return vals
+        except Exception:
+            pass
+
+    # Priority 3: inline proxy from df regime columns (if available)
+    # rq_proxy = rolling 5d volatility of regime_state (higher = more regime switching = lower quality)
+    try:
+        import polars as pl
+        if "gmm2_state" in df.columns and "vol_regime_enc" in df.columns:
+            gmm2_arr = df["gmm2_state"].to_numpy().astype(np.float64)
+            vol_arr  = df["vol_regime_enc"].to_numpy().astype(np.float64)
+            # Proxy: smoothness of gmm2 * (1 - vol normalised) -- stable regime = high rq
+            product  = gmm2_arr * (1.0 - vol_arr)
+            W = 240  # 4-hour rolling window on M1
+            rq_proxy = np.zeros(n, dtype=np.float32)
+            for i in range(W, n):
+                w = product[i-W:i]
+                rq_proxy[i] = float(np.clip(np.mean(w), 0., 1.))
+            rq_proxy[:W] = rq_proxy[W]  # fill warmup
+            if rq_proxy.std() > 0.01:
+                import logging; logging.getLogger(__name__).info("rq: computed from inline proxy")
+                return rq_proxy
+    except Exception:
+        pass
+
+    # Priority 4: constant fallback
+    warnings.warn(
+        "rq: no source available. Using 0.5 constant — feature[11] will be uninformative. "
+        "Pass --existing-npz to copy rq from previous training_ready.npz, or ensure "
+        "daily_regime_labels.csv has regime_quality_norm column."
+    )
+    return np.full(n, 0.5, dtype=np.float32)
 
 
 def _compute_session_phase(close_prices: np.ndarray, df) -> np.ndarray:

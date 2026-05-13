@@ -12,7 +12,7 @@ train_supervised.py and train_rl.py load in ~8 seconds, replacing:
 Total Colab startup saved: ~10 min → ~8 s per run.
 
 Output file layout (all arrays aligned, window_size already trimmed):
-    features        (N, 10)  float32  — scaled OHLCV + 4 micro features
+    features        (N, 12)  float32  — scaled OHLCV + 4 micro + session_phase + rq_regime
     labels          (N,)     int64    — ATR-adaptive labels (sell=0,hold=1,buy=2)
     close           (N,)     float64  — raw close prices
     high            (N,)     float64  — raw high prices
@@ -69,6 +69,10 @@ from src.training.labels import LabelConfig, get_labeler, ATRAdaptiveLabeler
 def main():
     parser = argparse.ArgumentParser(description="Precompute training-ready .npz")
     parser.add_argument("--data-dir",    default="data")
+    parser.add_argument("--csv",         default=None,
+                        help="Direct path to OHLCV CSV (bypasses TickStore/DuckDB)")
+    parser.add_argument("--existing-npz", default=None,
+                        help="Previous training_ready.npz to copy rq from if not in regime CSV")
     parser.add_argument("--symbol",      default="XAUUSD")
     parser.add_argument("--timeframe",   default="M1")
     parser.add_argument("--regime-csv",  default="data/regime/daily_regime_labels.csv")
@@ -87,12 +91,36 @@ def main():
     t_total = time.time()
 
     # ── 1. Load raw M1 data ──────────────────────────────────────────────────
-    logger.info(f"Loading {args.symbol} {args.timeframe} from {args.data_dir}/ticks.duckdb")
     t0 = time.time()
-    store = TickStore(f"{args.data_dir}/ticks.duckdb")
-    df    = store.query_ohlcv(args.symbol, args.timeframe)
-    store.close()
-    logger.info(f"  {len(df):,} bars loaded in {time.time()-t0:.1f}s")
+    if args.csv:
+        import polars as pl
+        logger.info(f"Loading from CSV: {args.csv}")
+        df = pl.read_csv(args.csv, try_parse_dates=True, infer_schema_length=10000)
+        df = df.rename({c: c.lower() for c in df.columns})
+        # Normalise common column name variants
+        rename_map = {}
+        for src_c, dst_c in [
+            ("time","timestamp"),("date","timestamp"),("datetime","timestamp"),
+            ("vol","tick_volume"),("volume","tick_volume"),
+            ("tickvol","tick_volume"),("tick_vol","tick_volume"),
+        ]:
+            if src_c in df.columns and dst_c not in df.columns:
+                rename_map[src_c] = dst_c
+        if rename_map:
+            df = df.rename(rename_map)
+        if "spread" not in df.columns:
+            df = df.with_columns(pl.lit(6).cast(pl.Int32).alias("spread"))
+        if "tick_volume" not in df.columns:
+            df = df.with_columns(pl.lit(50).cast(pl.Int64).alias("tick_volume"))
+        if df["timestamp"].dtype == pl.Utf8:
+            df = df.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
+        logger.info(f"  {len(df):,} bars loaded from CSV in {time.time()-t0:.1f}s")
+    else:
+        logger.info(f"Loading {args.symbol} {args.timeframe} from {args.data_dir}/ticks.duckdb")
+        store = TickStore(f"{args.data_dir}/ticks.duckdb")
+        df    = store.query_ohlcv(args.symbol, args.timeframe)
+        store.close()
+        logger.info(f"  {len(df):,} bars loaded in {time.time()-t0:.1f}s")
 
     # ── 2. Join regime labels ────────────────────────────────────────────────
     logger.info("Joining regime labels...")
@@ -179,6 +207,28 @@ def main():
     gs_q    = regime[:, 3]
     cu_au   = regime[:, 4]
     rq      = regime[:, 5]
+
+    # If rq is all-constant (0.5 placeholder from missing regime_quality_norm),
+    # attempt to copy from --existing-npz which has correctly computed rq values.
+    if rq.std() < 0.01 and args.existing_npz:
+        try:
+            _old = np.load(args.existing_npz, allow_pickle=True)
+            if "rq" in _old and len(_old["rq"]) == n:
+                rq = _old["rq"].astype(np.float64)
+                logger.info(f"rq: loaded from existing NPZ (std={rq.std():.4f})")
+            else:
+                logger.warning(f"rq: existing NPZ has wrong length or no rq column")
+        except Exception as e:
+            logger.warning(f"rq: could not load from existing NPZ: {e}")
+    elif rq.std() < 0.01:
+        logger.warning(
+            "rq: all values are 0.5 (regime_quality_norm missing from regime CSV). "
+            "Pass --existing-npz data/training_ready.npz to copy correct rq values. "
+            "Feature[11] will be uninformative without this."
+        )
+    else:
+        logger.info(f"rq: from regime CSV (std={rq.std():.4f} mean={rq.mean():.4f})")
+
     logger.info(f"  Bull={gmm2.mean():.1%}  Bear={1-gmm2.mean():.1%}  "
                 f"done in {time.time()-t0:.1f}s")
 
@@ -226,7 +276,7 @@ def main():
         "atr_min_tp":   args.atr_min_tp,
         "atr_max_tp":   args.atr_max_tp,
         "max_holding":  args.max_holding,
-        "feature_dim":  features.shape[1],
+        "feature_dim":  features.shape[1],  # 11: 6-OHLCV + 4-micro + session_phase
         "created":      time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     })
 

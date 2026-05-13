@@ -31,3 +31,6 @@ rust_inference/target/
 STEP_BY_STEP.md
 Dockerfile
 Makefile
+
+# aux files
+patch_npz_v2.ipynb
