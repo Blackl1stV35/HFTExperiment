@@ -608,23 +608,23 @@ def main(cfg: DictConfig) -> None:
 
     # ── Data loading — single precomputed .npz (fastest) or full pipeline ───
     # Priority:
-    #   1. training_ready.npz  — precomputed locally, ~8 s load, no preprocessing
+    #   1. training_ready_v2.npz  — precomputed locally, ~8 s load, no preprocessing
     #   2. Full pipeline       — DuckDB → regime join → scaler → labeller (~10 min)
     #
     # To use (1): run scripts/precompute_features.py locally, upload .npz to Drive,
     # then set paths.training_ready in config or pass +paths.training_ready=<path>
     ws = cfg.data.preprocessing.window_size
 
-    _ready_path = cfg.paths.get("training_ready", None)
+    _ready_path = cfg.paths.get("training_ready_v2", None)
     # Auto-detect from Drive if not set in config
     if _ready_path is None:
-        _drive_ready = Path("/content/drive/MyDrive/Colab Notebooks/training_ready.npz")
+        _drive_ready = Path("/content/drive/MyDrive/Colab Notebooks/training_ready_v2.npz")
         if _drive_ready.exists():
             _ready_path = str(_drive_ready)
 
     if _ready_path and Path(_ready_path).exists():
         # ── Fast path: load precomputed .npz (~8 s) ───────────────────────
-        logger.info(f"Loading precomputed training_ready: {_ready_path}")
+        logger.info(f"Loading precomputed training_ready_v2: {_ready_path}")
         _d = np.load(_ready_path, allow_pickle=True)
         features     = _d["features"]       # (N, 10) float32
         labels       = _d["labels"]         # (N,)    int64
@@ -647,7 +647,7 @@ def main(cfg: DictConfig) -> None:
 
     else:
         # ── Full pipeline fallback ────────────────────────────────────────
-        logger.info("training_ready.npz not found — running full preprocessing pipeline")
+        logger.info("training_ready_v2.npz not found — running full preprocessing pipeline")
         logger.info("  Tip: run scripts/precompute_features.py locally to avoid this")
 
         import polars as pl
