@@ -2,7 +2,7 @@ name: dual_branch
 type: dual_branch
 
 input:
-  feature_dim: 10        # 6-OHLCV + 4-micro
+  feature_dim: 12        # 6-OHLCV + 4-micro + session_phase + rq_regime (Phase 4 SUPERVISED)
   sequence_length: 240   # 4 hours M1 — scatter pool=2 → T_s=120 tokens
 
 d_model: 512             # Phase 5: Transformer (was 256 ScatterTCN)

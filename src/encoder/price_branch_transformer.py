@@ -135,10 +135,13 @@ class TransformerEncoderLayer(nn.Module):
         mask = torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1)
         self.register_buffer("causal_mask", mask)
 
-        # Head-wise RMSNorm (Li et al. ICML 2026) — deferred to Run 11 (fresh weights).
-        # Cannot be added mid-resume: optimizer param group mismatch + attention output
-        # rescaling destabilises training when loaded into pre-trained weights.
-        # self.head_scale = nn.Parameter(torch.ones(n_heads, 1, self.d_k))
+        # Head-wise RMSNorm (Li et al. ICML 2026) — ENABLED for Run 11.
+        # Suppresses bar-0 attention sink caused by causal masking variance discrepancy.
+        # Adds n_heads * d_k = d_model = 512 params per layer (0.003% of model).
+        # MUST train from scratch — cannot resume from Run 10 (optimizer group mismatch).
+        # Alcalde et al. 2025 confirms theoretical grounding: breaks V*B^T eigenspace locking.
+        # Long stream TransformerBlock only — short stream (w=20) is already sink-free.
+        self.head_scale = nn.Parameter(torch.ones(n_heads, 1, self.d_k))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, d_model)
@@ -156,6 +159,9 @@ class TransformerEncoderLayer(nn.Module):
             dropout_p = self.attn_drop if self.training else 0.0,
             is_causal  = False,
         )
+        # Head-wise RMSNorm: normalise per-head before output projection.
+        # attn_out: (B, n_heads, T, d_k) — norm over d_k, scale per head.
+        attn_out = attn_out / (attn_out.norm(dim=-1, keepdim=True) + 1e-8)                    * self.head_scale
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
         x = x + self.out_proj(attn_out)
 

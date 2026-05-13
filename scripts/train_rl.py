@@ -495,14 +495,49 @@ def main():
     logger.info(f"ret_1h: mean={ret_1h_arr.mean():.4f} std={ret_1h_arr.std():.4f}")
     logger.info(f"ret_15m: mean={ret_15m_arr.mean():.4f} std={ret_15m_arr.std():.4f}")
 
-    # ── VIO: DISABLED — obs[15] = zeros ─────────────────────────────────────
-    # Phase 6: true VIO (std=0.030) → WR collapse 51.2%->41.5% (near-flat signal).
-    # Phase 8: session-aware VIO → bimodal distribution (0 during Asian,
-    # variable during London+NY) → SAC diverged (tr oscillates 0->3200).
-    # Both VIO variants are harder for SAC than constant zero.
-    # Deferred until smooth continuous normalisation across all sessions is designed.
+    # ── Session-aware VIO (Phase 4 validated) ──────────────────────────────
+    # Phase 6 root cause: bimodal obs[15] (exact 0 during Asian, variable London+NY)
+    # was harder for SAC than constant zero (discontinuous signal).
+    # Fix: compute VIO only on active session bars AND normalise by session-volume
+    # baseline so the signal is smooth and continuous across all 24h.
+    # Validated by session analysis in phase4_feature_exploration.ipynb:
+    # sell labels concentrate in London+NY; Asian session is low-signal dead zone.
+    # Bangkok UTC+7: active = 15:00-05:00 BKK = 08:00-22:00 UTC.
+    logger.info('Computing session-aware VIO (smooth London+NY normalised)...')
+    W_VIO        = 20
+    ACTIVE_START = 8    # London open UTC
+    ACTIVE_END   = 22   # NY close UTC
+
+    if seq_ts is not None:
+        utc_h = ((np.asarray(seq_ts, dtype=np.int64) // (3600 * 10**9)) % 24).astype(np.int32)
+        active_mask = (utc_h >= ACTIVE_START) & (utc_h < ACTIVE_END)
+        logger.info(f'  active={active_mask.sum():,} ({100*active_mask.mean():.1f}%) | Asian zeroed')
+    else:
+        active_mask = np.ones(len(seq_prices), dtype=bool)
+        logger.warning('  seq_ts unavailable -- all bars active')
+
+    try:
+        tick_vol = _d['tick_volume_raw'].astype(np.float64)
+    except Exception:
+        tick_vol = np.ones(len(seq_prices), dtype=np.float64)
+        logger.warning('  tick_volume_raw not in NPZ -- uniform fallback')
+
+    bar_dir = np.sign(
+        seq_prices - np.concatenate([[seq_prices[0]], seq_prices[:-1]])
+    ).astype(np.float64)
+
+    # Session-normalised VIO: Asian bars contribute 0 to both numerator and
+    # denominator -- signal is smooth (no on/off switching across sessions)
+    session_vol = tick_vol * active_mask
     inv_pressure_arr = np.zeros(len(seq_prices), dtype=np.float32)
-    logger.info("inv_pressure obs[15]: DISABLED (VIO bimodal instability)")
+    for i in range(len(seq_prices)):
+        lo  = max(0, i - W_VIO + 1)
+        sv  = session_vol[lo:i+1]
+        num = np.sum(sv * bar_dir[lo:i+1])
+        den = sv.sum() + 1e-8
+        inv_pressure_arr[i] = float(num / den)
+
+    logger.info(f'  inv_pressure: mean={inv_pressure_arr.mean():.4f} std={inv_pressure_arr.std():.4f}')
 
     split = int(len(signals) * 0.8)
     logger.info(f"Train={split:,} Eval={len(signals)-split:,}")

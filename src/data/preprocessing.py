@@ -128,6 +128,74 @@ def get_scaler(method: str, window_size: int):
 
 # ── OHLCV feature preparation ─────────────────────────────────────────────────
 
+def _compute_rq(df) -> np.ndarray:
+    """Extract regime quality (rq) from the dataframe or return zeros.
+
+    rq is computed by the GMM2 regime model during data ingestion and stored
+    in the NPZ. If available in df, extract directly; otherwise return 0.5.
+    Range [0, 0.92]. Higher = more confident regime assignment.
+
+    Phase 4 exploration: KS=0.623 STRONG, MI=0.198 (21x OHLCV), ratio=0.60 PASS.
+    Strongest supervised addition found across all exploration phases.
+    """
+    try:
+        if "rq" in df.columns:
+            return df["rq"].to_numpy().astype(np.float32)
+        elif "regime_quality" in df.columns:
+            return df["regime_quality"].to_numpy().astype(np.float32)
+        else:
+            # rq not in raw CSV — will be 0.5 placeholder
+            # The NPZ rebuild pipeline should join rq from regime labels CSV
+            import warnings
+            warnings.warn("rq column not found in df — using 0.5 placeholder. "
+                          "Join regime labels before NPZ rebuild for correct rq values.")
+            return np.full(len(df), 0.5, dtype=np.float32)
+    except Exception:
+        return np.full(len(df), 0.5, dtype=np.float32)
+
+
+def _compute_session_phase(close_prices: np.ndarray, df) -> np.ndarray:
+    """Compute session_phase feature aligned to the close_prices array.
+
+    Returns float32 array in [0, 1]:
+        0.0 = Asian session (00:00-08:00 UTC, low-signal dead zone)
+        0.5 = NY session   (16:00-22:00 UTC)
+        1.0 = London session (08:00-16:00 UTC, peak sell label rate 5.07%)
+
+    Validated in phase4_feature_exploration.ipynb:
+        KS=0.117 STRONG, MI=0.037 (3.99x OHLCV), ratio=2.96 PASS -> SUPERVISED
+        London sell rate 1.44x baseline; Asian 0.77x.
+    """
+    import polars as pl
+    n = len(close_prices)
+    session = np.full(n, 0.0, dtype=np.float32)  # default = Asian
+
+    try:
+        ts_col = df["timestamp"]
+        for i in range(n):
+            try:
+                ts = ts_col[i]
+                hour = ts.hour if hasattr(ts, "hour") else int((int(ts) // (3600 * 10**9)) % 24)
+                if 8 <= hour < 16:
+                    session[i] = 1.0    # London
+                elif 16 <= hour < 22:
+                    session[i] = 0.5    # NY
+                # else: Asian = 0.0 (default)
+            except Exception:
+                session[i] = 0.5
+    except Exception:
+        # Vectorised fallback if polars timestamp available
+        try:
+            ts_ns = df["timestamp"].cast(pl.Datetime).to_numpy().astype(np.int64)
+            hours = (ts_ns // (3600 * 10**9) % 24).astype(np.int32)
+            session = np.where((hours >= 8)  & (hours < 16), 1.0,
+                      np.where((hours >= 16) & (hours < 22), 0.5, 0.0)).astype(np.float32)
+        except Exception:
+            session[:] = 0.5  # safe fallback
+
+    return session
+
+
 def prepare_features(
     df: pl.DataFrame,
     scaler_method: str = "window_minmax",
@@ -203,13 +271,35 @@ def prepare_features(
     scaled_6d  = scaler.transform(features).astype(np.float32)
     scaled_10d = np.concatenate([scaled_6d, micro_4d], axis=1)  # (N, 10)
 
-    logger.info(f"Features prepared: {scaled_10d.shape}  (6-dim OHLCV + 4-dim micro)")
+    # ── Feature 11: session_phase (Phase 4 exploration — SUPERVISED verdict) ──
+    # KS=0.117 STRONG, MI=0.037 (3.99x OHLCV mean), redundancy ratio=2.96 PASS.
+    # First confirmed supervised addition from all Phase 4-8 exploration.
+    # session_phase encodes London/NY session presence: 0=Asian, 0.5=transition, 1=peak.
+    # Already in RL obs (obs[9]) and NPZ separately — now added to supervised features.
+    # London sell rate = 5.07% (1.44x baseline), Asian = 2.69% (0.77x baseline).
+    session_phase_feat = _compute_session_phase(close_prices, df)
+    scaled_11d = np.concatenate(
+        [scaled_10d, session_phase_feat.reshape(-1, 1)], axis=1
+    )  # (N, 11)
+
+    # ── Feature 12: rq_regime (Phase 4 exploration — SUPERVISED verdict) ───────
+    # KS=0.623 STRONG, MI=0.198 (21x OHLCV mean), ratio=0.60 PASS.
+    # Strongest supervised addition found across all Phase 4-8 exploration.
+    # rq = regime quality scalar from GMM2 model, range [0, 0.92].
+    # Quantifies model confidence in current regime assignment.
+    # Already in RL obs (obs[10] = regime_quality) and NPZ — zero preprocessing cost.
+    rq_feat = _compute_rq(df)
+    scaled_12d = np.concatenate(
+        [scaled_11d, rq_feat.reshape(-1, 1)], axis=1
+    )  # (N, 12)
+
+    logger.info(f"Features prepared: {scaled_12d.shape}  (6-OHLCV + 4-micro + session_phase + rq_regime)")
     if cache_path is not None:
         npz = cache_path if cache_path.endswith(".npz") else cache_path + ".npz"
-        np.savez_compressed(npz, features=scaled_10d,
+        np.savez_compressed(npz, features=scaled_12d,
                             close=close_prices, high=high_prices, low=low_prices)
         logger.info(f"Feature cache saved: {npz}")
-    return scaled_10d, close_prices, high_prices, low_prices
+    return scaled_12d, close_prices, high_prices, low_prices
 
 
 # ── Regime label joining (Step 2) ─────────────────────────────────────────────

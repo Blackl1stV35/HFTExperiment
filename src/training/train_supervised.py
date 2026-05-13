@@ -237,6 +237,17 @@ def build_regime_balanced_sampler(
             bear_only_mask  = bear_mask & ~high_mask
             regime_mult[bear_only_mask] = 2.0
             regime_mult[bear_high_mask] = bear_high_mult
+
+            # DHPF Bear-SHOCK partition (P7 Zhao et al 2025, pending retest).
+            # vol_enc >= 0.95 = top 5% of high-vol events (event shock bars).
+            # Applied on top of Bear-HIGH mult: shock bars within Bear+HIGH get extra boost.
+            # Multiplier calibrated from DHPF retest results — placeholder 4.0 pending.
+            if hasattr(self, '_dhpf_shock_mult'):
+                shock_threshold = 0.95
+                shock_mask = (vol_enc >= shock_threshold) & bear_mask
+                regime_mult[shock_mask] = self._dhpf_shock_mult
+                logger.info(f"DHPF Bear-SHOCK x{self._dhpf_shock_mult}: "
+                            f"n={shock_mask.sum():,} ({100*shock_mask.mean():.2f}%)")
             n_bear_high = bear_high_mask.sum()
             n_bear_only = bear_only_mask.sum()
             n_sell_bh   = ((labels == 0) & bear_high_mask).sum()
@@ -251,6 +262,32 @@ def build_regime_balanced_sampler(
             # Fallback if vol_enc unavailable — original Bear x2.0 only
             regime_mult[bear_mask] = 2.0
             logger.warning("vol_enc not available — Bear+HIGH mult skipped, using Bear x2.0")
+
+    # ── DHPF partition boosts (Phase 4 exploration validated) ────────────────
+    # Bear-SHOCK (vol_enc >= 0.95) already has sell%=14.4% (4x baseline) -- NO boost needed.
+    # Underrepresented partitions confirmed by DHPF retest:
+    #   Bull-LOW    sell=1.04% -> x6.7  (most underrepresented -- 36% of data)
+    #   Bull-NORMAL sell=2.28% -> x3.1
+    #   Bear-NORMAL sell=1.54% -> x4.6  (small partition but very low sell rate)
+    # Strategy: boost Bull partitions to expose model to sell signals in dominant regime.
+    if vol_enc is not None and len(vol_enc) == n and gmm2 is not None and len(gmm2) == n:
+        bull_mask   = gmm2 == 1
+        bull_low    = bull_mask & (vol_enc < 0.25)
+        bull_normal = bull_mask & (vol_enc >= 0.25) & (vol_enc < 0.75)
+        bear_normal = (~bull_mask) & (vol_enc >= 0.25) & (vol_enc < 0.75)
+
+        # Apply multiplicative boosts on top of existing regime_mult
+        regime_mult[bull_low]    *= 6.7   # sell=1.04% -> effective 7% with boost
+        regime_mult[bull_normal] *= 3.1   # sell=2.28% -> effective 7%
+        regime_mult[bear_normal] *= 4.6   # sell=1.54% -> effective 7%
+
+        logger.info(
+            f"DHPF partition boosts applied: "
+            f"Bull-LOW x6.7 (n={bull_low.sum():,}), "
+            f"Bull-NORMAL x3.1 (n={bull_normal.sum():,}), "
+            f"Bear-NORMAL x4.6 (n={bear_normal.sum():,})"
+        )
+        logger.info("Bear-SHOCK: NO boost (sell%=14.4%, already 4x baseline)")
 
     if timestamps is not None and len(timestamps) == n:
         import pandas as pd
@@ -379,7 +416,13 @@ class Trainer:
         if unexpected:
             logger.warning(f"  Unexpected keys in checkpoint (ignored): {unexpected}")
 
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        try:
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        except (ValueError, KeyError) as e:
+            # Optimizer param groups changed (e.g. new head_scale params added).
+            # Skip optimizer state — LR will be reset by reset_lr anyway.
+            logger.warning(f"  Optimizer state skipped (param group mismatch: {e})")
+            logger.warning("  Optimizer reinitialised from scratch — LR reset will apply.")
         self.start_epoch       = ckpt.get("epoch", 0) + 1
         self.best_signal_score = ckpt.get("metrics", {}).get("signal_score", 0.0)
         self.best_val_loss     = ckpt.get("metrics", {}).get("loss", float("inf"))

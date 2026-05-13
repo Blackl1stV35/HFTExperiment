@@ -10,7 +10,7 @@ project:
   device: auto
 
 training:
-  epochs: 150   # Run 9: Bear+HIGH oversampling, 3 LR decay cycles target
+  epochs: 200   # Run 11: fresh + RMSNorm, 4 LR decay cycles target
   batch_size: 4096          # A100 80 GB — 4× T4's 2048
   learning_rate: 5e-5
   weight_decay: 0.005   # was 0.05 — overcorrected
