@@ -238,16 +238,8 @@ def build_regime_balanced_sampler(
             regime_mult[bear_only_mask] = 2.0
             regime_mult[bear_high_mask] = bear_high_mult
 
-            # DHPF Bear-SHOCK partition (P7 Zhao et al 2025, pending retest).
-            # vol_enc >= 0.95 = top 5% of high-vol events (event shock bars).
-            # Applied on top of Bear-HIGH mult: shock bars within Bear+HIGH get extra boost.
-            # Multiplier calibrated from DHPF retest results — placeholder 4.0 pending.
-            if hasattr(self, '_dhpf_shock_mult'):
-                shock_threshold = 0.95
-                shock_mask = (vol_enc >= shock_threshold) & bear_mask
-                regime_mult[shock_mask] = self._dhpf_shock_mult
-                logger.info(f"DHPF Bear-SHOCK x{self._dhpf_shock_mult}: "
-                            f"n={shock_mask.sum():,} ({100*shock_mask.mean():.2f}%)")
+            # DHPF Bear-SHOCK: sell%=14.4% (4x baseline) -- NO extra boost needed.
+            # Bear+HIGH mult already handles this partition sufficiently.
             n_bear_high = bear_high_mask.sum()
             n_bear_only = bear_only_mask.sum()
             n_sell_bh   = ((labels == 0) & bear_high_mask).sum()
@@ -608,23 +600,23 @@ def main(cfg: DictConfig) -> None:
 
     # ── Data loading — single precomputed .npz (fastest) or full pipeline ───
     # Priority:
-    #   1. training_ready_v2.npz  — precomputed locally, ~8 s load, no preprocessing
+    #   1. training_ready.npz  — precomputed locally, ~8 s load, no preprocessing
     #   2. Full pipeline       — DuckDB → regime join → scaler → labeller (~10 min)
     #
     # To use (1): run scripts/precompute_features.py locally, upload .npz to Drive,
     # then set paths.training_ready in config or pass +paths.training_ready=<path>
     ws = cfg.data.preprocessing.window_size
 
-    _ready_path = cfg.paths.get("training_ready_v2", None)
+    _ready_path = cfg.paths.get("training_ready", None)
     # Auto-detect from Drive if not set in config
     if _ready_path is None:
-        _drive_ready = Path("/content/drive/MyDrive/Colab Notebooks/training_ready_v2.npz")
+        _drive_ready = Path("/content/drive/MyDrive/Colab Notebooks/training_ready.npz")
         if _drive_ready.exists():
             _ready_path = str(_drive_ready)
 
     if _ready_path and Path(_ready_path).exists():
         # ── Fast path: load precomputed .npz (~8 s) ───────────────────────
-        logger.info(f"Loading precomputed training_ready_v2: {_ready_path}")
+        logger.info(f"Loading precomputed training_ready: {_ready_path}")
         _d = np.load(_ready_path, allow_pickle=True)
         features     = _d["features"]       # (N, 10) float32
         labels       = _d["labels"]         # (N,)    int64
@@ -647,7 +639,7 @@ def main(cfg: DictConfig) -> None:
 
     else:
         # ── Full pipeline fallback ────────────────────────────────────────
-        logger.info("training_ready_v2.npz not found — running full preprocessing pipeline")
+        logger.info("training_ready.npz not found — running full preprocessing pipeline")
         logger.info("  Tip: run scripts/precompute_features.py locally to avoid this")
 
         import polars as pl
