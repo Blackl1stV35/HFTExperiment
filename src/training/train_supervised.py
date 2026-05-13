@@ -608,17 +608,23 @@ def main(cfg: DictConfig) -> None:
     ws = cfg.data.preprocessing.window_size
 
     _ready_path = cfg.paths.get("training_ready", None)
-    # Auto-detect from Drive if not set in config
+    # Auto-detect from Drive if not set in config — prefer v2 (12D) over v1 (10D)
     if _ready_path is None:
-        _drive_ready = Path("/content/drive/MyDrive/Colab Notebooks/training_ready.npz")
-        if _drive_ready.exists():
-            _ready_path = str(_drive_ready)
+        _drive_v2 = Path("/content/drive/MyDrive/Colab Notebooks/training_ready_v2.npz")
+        _drive_v1 = Path("/content/drive/MyDrive/Colab Notebooks/training_ready.npz")
+        if _drive_v2.exists():
+            _ready_path = str(_drive_v2)
+            logger.info("Auto-detected training_ready_v2.npz (12D features)")
+        elif _drive_v1.exists():
+            _ready_path = str(_drive_v1)
+            logger.warning("training_ready_v2.npz not found — falling back to v1 (10D). "
+                           "Run patch_npz_v2.ipynb on Colab to generate v2.")
 
     if _ready_path and Path(_ready_path).exists():
         # ── Fast path: load precomputed .npz (~8 s) ───────────────────────
         logger.info(f"Loading precomputed training_ready: {_ready_path}")
         _d = np.load(_ready_path, allow_pickle=True)
-        features     = _d["features"]       # (N, 10) float32
+        features     = _d["features"]       # (N, 10) or (N, 12) float32
         labels       = _d["labels"]         # (N,)    int64
         close_prices = _d["close"]          # (N,)    float64
         high_prices  = _d["high"]           # (N,)    float64
