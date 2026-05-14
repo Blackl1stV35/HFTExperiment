@@ -68,13 +68,31 @@ def _load_supervised(checkpoint_path: str, cfg_path: str):
 
 
 def _load_rl_agent(checkpoint_path: str):
-    """Load ConfidenceSACAgent from .pt checkpoint (obs_dim=16)."""
-    from src.meta_policy.rl_agent import ConfidenceSACAgent
+    """Load ConfidenceSACAgent — infers obs_dim from checkpoint first-layer shape.
 
-    agent = ConfidenceSACAgent(obs_dim=16, hidden_dims=[512, 512], device="cpu")
+    Supports both 16D (Phase 8b) and 18D (Phase 9) checkpoints automatically.
+    """
+    from src.meta_policy.rl_agent import ConfidenceSACAgent
+    import torch
+
+    # Peek at checkpoint to infer obs_dim from actor first-layer weight shape
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    obs_dim = 16  # safe default for Phase 8b
+    for sd_key in ("actor_state_dict", "agent_state_dict", "state_dict"):
+        sd = ckpt.get(sd_key, {})
+        for k, v in sd.items():
+            if hasattr(v, "shape") and v.ndim == 2:
+                # First weight matrix in actor: shape = (hidden, obs_dim)
+                obs_dim = int(v.shape[1])
+                break
+        if sd:
+            break
+
+    logger.info(f"RL checkpoint obs_dim inferred: {obs_dim}")
+    agent = ConfidenceSACAgent(obs_dim=obs_dim, hidden_dims=[512, 512], device="cpu")
     agent.load(checkpoint_path)
-    logger.info(f"RL agent loaded: {checkpoint_path}")
-    return agent
+    logger.info(f"RL agent loaded: {checkpoint_path}  (obs_dim={obs_dim})")
+    return agent, obs_dim
 
 
 # ── feature engineering ───────────────────────────────────────────────────────
@@ -221,12 +239,26 @@ def build_rl_obs(
     cu_au_regime: float,
     ret_1h: float,
     ret_15m: float,
+    session_phase_npz: float = 0.5,
+    rq_regime: float = 0.5,
 ) -> np.ndarray:
-    """Build 16-dim RL observation vector matching train_rl.py exactly.
+    """Build RL observation vector — dimensionality matches the loaded checkpoint.
 
-    obs[15] = 0.0 (VIO disabled — bimodal instability, see Phase 6/8 post-mortems)
+    Phase 8b / RL Phase 9 (16D):
+        obs[0-3]   probs + confidence
+        obs[4-6]   position_dir, unrealized_pnl, hold_frac
+        obs[7-9]   atr_norm, trend_norm, session_phase
+        obs[10-12] regime_quality, gs_quartile, cu_au_regime
+        obs[13-14] ret_1h, ret_15m
+        obs[15]    VIO (zero — bimodal instability)
+
+    RL Phase 9+ (18D) adds:
+        obs[16]    session_phase_npz
+        obs[17]    rq_regime
+
+    The obs_dim is inferred from the loaded RL checkpoint actor first-layer shape.
     """
-    return np.array([
+    base = np.array([
         probs[0], probs[1], probs[2], confidence,           # 0-3
         position_dir, unrealized_pnl, hold_frac,            # 4-6
         atr_norm, trend_norm, session_phase,                 # 7-9
@@ -234,6 +266,10 @@ def build_rl_obs(
         ret_1h, ret_15m,                                     # 13-14
         0.0,                                                 # 15 VIO disabled
     ], dtype=np.float32)
+    # Append Phase 9 features only if checkpoint expects 18D
+    # (checked at load time by _rl_obs_dim set in _load_rl_agent)
+    ext = np.array([session_phase_npz, rq_regime], dtype=np.float32)
+    return base  # extended to 18D in run() when self._rl_obs_dim == 18
 
 
 # ── RL action ─────────────────────────────────────────────────────────────────
@@ -451,7 +487,7 @@ class TradingLoop:
         if not Path(rl_ckpt).exists():
             logger.error(f"RL checkpoint not found: {rl_ckpt}")
             return False
-        self.rl_agent = _load_rl_agent(rl_ckpt)
+        self.rl_agent, self._rl_obs_dim = _load_rl_agent(rl_ckpt)
 
         # Circuit breaker
         acct_info = {"balance": 100_000.0}  # updated each loop from broker
@@ -624,17 +660,25 @@ class TradingLoop:
                                  * self.position["lots"] * 100.0
                     hold_frac  = min(1.0, self.hold_bars / self.max_hold)
 
-                rl_obs = build_rl_obs(
+                # Build base 16D obs; extend to 18D if Phase 9 RL agent loaded
+                _rl_obs_16 = build_rl_obs(
                     probs=probs, confidence=conf,
                     position_dir=pos_dir, unrealized_pnl=unreal_pnl,
                     hold_frac=hold_frac,
                     atr_norm=atr_n, trend_norm=trend_n,
                     session_phase=session_ph,
                     regime_quality=gmm2,
-                    gs_quartile=0.5,    # placeholder — not available live
-                    cu_au_regime=0.5,   # placeholder — not available live
+                    gs_quartile=0.5,
+                    cu_au_regime=0.5,
                     ret_1h=ret_1h, ret_15m=ret_15m,
                 )
+                if getattr(self, '_rl_obs_dim', 16) == 18:
+                    rl_obs = np.concatenate([
+                        _rl_obs_16,
+                        np.array([session_ph, float(vol_enc)], dtype=np.float32),
+                    ])
+                else:
+                    rl_obs = _rl_obs_16
 
                 # ── RL action ──────────────────────────────────────────────
                 size_signal, exit_signal, rl_lat = run_rl(self.rl_agent, rl_obs)

@@ -163,6 +163,8 @@ class FrozenEncoderEnv(gym.Env):
         ret_1h:         np.ndarray | None = None,   # Phase 6: 60-bar log-return z-score
         ret_15m:        np.ndarray | None = None,   # Phase 6: 15-bar log-return z-score
         inv_pressure:   np.ndarray | None = None,   # Phase 8: inventory_pressure_vio (obs[15])
+        session_phase_npz: np.ndarray | None = None, # Phase 9: NPZ session_phase directly (obs[16])
+        rq_regime:         np.ndarray | None = None, # Phase 9: regime quality from NPZ (obs[17])
         max_hold:              int   = 80,
         episode_len:           int   = 8000,
         confidence_gate:       float = 0.70,
@@ -202,7 +204,13 @@ class FrozenEncoderEnv(gym.Env):
         # Redundancy ratio=2.62 vs spread_pressure fails supervised threshold,
         # but RL policy never sees spread_pressure directly — only frozen encoder
         # output probs. VIO provides direct inventory-imbalance signal.
-        self.inv_pressure   = _arr(inv_pressure,   lambda n: np.zeros(n, np.float32))
+        self.inv_pressure      = _arr(inv_pressure,   lambda n: np.zeros(n, np.float32))
+        # Phase 9: session_phase and rq from NPZ — validated SUPERVISED features
+        # session_phase: KS=0.117 STRONG, MI=0.037 (3.99x OHLCV), ratio=2.96 PASS
+        # rq_regime:     KS=0.623 STRONG, MI=0.198 (21x OHLCV), ratio=0.60 PASS
+        # Both are non-redundant from RL perspective (not in frozen encoder obs)
+        self.session_phase_npz = _arr(session_phase_npz, lambda n: np.full(n, 0.5, np.float32))
+        self.rq_regime         = _arr(rq_regime,         lambda n: np.full(n, 0.5, np.float32))
 
         self._max_hold_default = max_hold
         self.episode_len       = min(episode_len, n - 1)
@@ -216,7 +224,7 @@ class FrozenEncoderEnv(gym.Env):
         self.early_cut_bonus_frac   = early_cut_bonus_frac
         self.exit_threshold: float  = 0.0
 
-        self.observation_space = spaces.Box(-np.inf, np.inf, (16,), np.float32)  # +ret_1h, +ret_15m, +inv_pressure
+        self.observation_space = spaces.Box(-np.inf, np.inf, (18,), np.float32)  # +session_phase_npz(16), +rq_regime(17)
         self.action_space      = spaces.Box(-1.0, 1.0, (2,), np.float32)
         self._offset = 0
         self._reset_state()
@@ -267,6 +275,8 @@ class FrozenEncoderEnv(gym.Env):
             self.regime_quality[gi], self.gs_quartile[gi], self.cu_au_regime[gi],  # 10-12
             self.ret_1h[gi], self.ret_15m[gi],                              # 13-14 (Phase 6)
             self.inv_pressure[gi],                                          # 15    (Phase 8)
+            self.session_phase_npz[gi],                                     # 16    (Phase 9: London=1.0, NY=0.5, Asian=0.0)
+            self.rq_regime[gi],                                             # 17    (Phase 9: regime quality [0,0.92])
         ], dtype=np.float32)
 
     def _close_position(self, voluntary=False):
@@ -564,6 +574,8 @@ def main():
             cu_au_regime=seq_cu[lo:hi], gmm2_state=seq_gmm2[lo:hi],
             ret_1h=ret_1h_arr[lo:hi], ret_15m=ret_15m_arr[lo:hi],
             inv_pressure=inv_pressure_arr[lo:hi],
+            session_phase_npz=session_phase[lo:hi],   # Phase 9 obs[16]: NPZ session_phase
+            rq_regime=seq_rq[lo:hi],                   # Phase 9 obs[17]: NPZ rq
             max_hold=args.max_hold, episode_len=args.episode_len,
             confidence_gate=args.confidence_gate,
             commission_usd=comm, spread_pips=sp,
@@ -575,7 +587,7 @@ def main():
     eval_env  = make_env(split, len(signals), args.commission, args.spread_pips)
 
     agent = ConfidenceSACAgent(
-        obs_dim=16, hidden_dims=[512, 512],  # +ret_1h, +ret_15m, +inv_pressure
+        obs_dim=18, hidden_dims=[512, 512],  # +session_phase_npz(16), +rq_regime(17)
         device=str(device), curriculum_warmup_steps=args.curriculum_warmup,
         buffer_capacity=2_000_000, batch_size=2048,
     )
