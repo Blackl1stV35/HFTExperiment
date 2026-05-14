@@ -75,7 +75,8 @@ class CircuitBreaker:
             self.state.position_size_multiplier = self.loss_reduction_factor
             logger.warning(
                 f"Consecutive loss limit ({self.max_consecutive_losses}) — "
-                f"reducing position size by {self.loss_reduction_factor}"
+                f"position size multiplier set to {self.loss_reduction_factor} "
+                f"(clamped to min 0.01 lot if base_lots * factor < 0.01)"
             )
             # Don't halt, but reduce size
 
@@ -113,9 +114,16 @@ class CircuitBreaker:
                     self.state.position_size_multiplier + (1.0 / self.recovery_trades),
                 )
 
-    def get_position_size(self, base_lots: float = 0.01) -> float:
-        """Get risk-adjusted position size."""
-        return base_lots * self.state.position_size_multiplier
+    def get_position_size(self, base_lots: float = 0.01,
+                          min_lots: float = 0.01) -> float:
+        """Get risk-adjusted position size.
+
+        Clamps to min_lots (default 0.01 = MT5 minimum for XAUUSD) so that
+        loss_reduction_factor can never produce an invalid volume order.
+        0.01 * 0.5 = 0.005 is below MT5 minimum -> would cause Order failed: Invalid volume.
+        """
+        size = base_lots * self.state.position_size_multiplier
+        return max(size, min_lots)
 
     def add_news_event(self, event_time: datetime) -> None:
         """Register a scheduled news event for blackout enforcement."""
