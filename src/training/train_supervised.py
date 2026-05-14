@@ -255,31 +255,15 @@ def build_regime_balanced_sampler(
             regime_mult[bear_mask] = 2.0
             logger.warning("vol_enc not available — Bear+HIGH mult skipped, using Bear x2.0")
 
-    # ── DHPF partition boosts (Phase 4 exploration validated) ────────────────
-    # Bear-SHOCK (vol_enc >= 0.95) already has sell%=14.4% (4x baseline) -- NO boost needed.
-    # Underrepresented partitions confirmed by DHPF retest:
-    #   Bull-LOW    sell=1.04% -> x6.7  (most underrepresented -- 36% of data)
-    #   Bull-NORMAL sell=2.28% -> x3.1
-    #   Bear-NORMAL sell=1.54% -> x4.6  (small partition but very low sell rate)
-    # Strategy: boost Bull partitions to expose model to sell signals in dominant regime.
-    if vol_enc is not None and len(vol_enc) == n and gmm2 is not None and len(gmm2) == n:
-        bull_mask   = gmm2 == 1
-        bull_low    = bull_mask & (vol_enc < 0.25)
-        bull_normal = bull_mask & (vol_enc >= 0.25) & (vol_enc < 0.75)
-        bear_normal = (~bull_mask) & (vol_enc >= 0.25) & (vol_enc < 0.75)
-
-        # Apply multiplicative boosts on top of existing regime_mult
-        regime_mult[bull_low]    *= 6.7   # sell=1.04% -> effective 7% with boost
-        regime_mult[bull_normal] *= 3.1   # sell=2.28% -> effective 7%
-        regime_mult[bear_normal] *= 4.6   # sell=1.54% -> effective 7%
-
-        logger.info(
-            f"DHPF partition boosts applied: "
-            f"Bull-LOW x6.7 (n={bull_low.sum():,}), "
-            f"Bull-NORMAL x3.1 (n={bull_normal.sum():,}), "
-            f"Bear-NORMAL x4.6 (n={bear_normal.sum():,})"
-        )
-        logger.info("Bear-SHOCK: NO boost (sell%=14.4%, already 4x baseline)")
+    # ── DHPF partition boosts -- DISABLED for Run 12 ────────────────────────
+    # Run 11 post-mortem: Bull-LOW x6.7 flooded training with 1.55M low-quality
+    # sell labels (sell%=1.04% in Bull-LOW regime). This degraded Bear-regime
+    # sell precision from 0.302 (Run 10) to 0.284 (Run 11).
+    # Equalizing sell RATE != improving sell PRECISION.
+    # Run 12 isolates: RMSNorm + session_phase + rq only vs Run 10 baseline.
+    # If sell P >= 0.31 in Run 12: re-introduce DHPF with conservative x2.0 cap.
+    # If sell P <= 0.302: label noise floor confirmed, DHPF deferred to Run 13+.
+    logger.info("DHPF Bull partition boosts: DISABLED (Run 12 isolation test)")
 
     if timestamps is not None and len(timestamps) == n:
         import pandas as pd
