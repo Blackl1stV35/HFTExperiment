@@ -422,8 +422,24 @@ class Trainer:
         gdrive = Path(self.GDRIVE_DIR)
         if gdrive.exists():
             dest = gdrive / Path(path).name
-            shutil.copy2(path, dest)
-            logger.info(f"Mirrored to Drive: {dest}")
+            # Retry Drive mirror up to 3 times — Errno 5 (I/O error) is a transient
+            # Drive disconnect that resolves on retry. Never crash training over a mirror.
+            for _attempt in range(3):
+                try:
+                    shutil.copy2(path, dest)
+                    logger.info(f"Mirrored to Drive: {dest}")
+                    break
+                except OSError as _e:
+                    if _attempt < 2:
+                        import time as _t
+                        logger.warning(f"Drive mirror attempt {_attempt+1} failed: {_e} — retrying in 5s")
+                        _t.sleep(5)
+                    else:
+                        logger.error(
+                            f"Drive mirror FAILED after 3 attempts: {_e}\n"
+                            f"Checkpoint safe locally at: {path}\n"
+                            f"Manually copy after run: cp {path} '{dest}'"
+                        )
         else:
             logger.warning(
                 f"Drive not mounted at {self.GDRIVE_DIR} — local save only. "
