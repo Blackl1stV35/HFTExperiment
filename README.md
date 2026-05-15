@@ -1,6 +1,14 @@
-## Underdevelopment 
+# Ongoing Experiment (update: 15/05/2026)
 
-## Phase 5 Architecture 
+I am open for contribution, if you are interested in applying machine processing into financial time-series forecast, please contact me at kanokphan.s@ku.th. I am eager for any discussion toward investment research and trading
+
+### To-do Lists
+- [ ] Re-labelling distribution approach
+- [ ] Collecting paper trade logs for direction change 
+
+(see: [Release Note v2.13.9: Technical Research Plan]([text](https://github.com/Blackl1stV35/HFTExperiment/releases/tag/v2.13.9)))
+
+## Phase 5 Architecture
 
 Digram Sketch: v0.5.3.1-PriceBranchTransformer-ScatterPool-enriched
 - (1) Astrocyte Routing: K=16 learned pattern slots
@@ -79,7 +87,7 @@ TemperatureScaling (post-hoc, scalar T)
 Calibrated Probabilities (B, C)
 ```
 
-## Project Structure (not finalised)
+## Core Project Structure
 
 ```
 HFTExperiment/
